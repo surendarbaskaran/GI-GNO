@@ -184,10 +184,11 @@ BATCH_SIZE = {BATCH_SIZE}
         )
 
         # Save epoch model
-        torch.save(
-            model.state_dict(),
-            os.path.join(PT_OUT_DIR, f"model_epoch_{epoch}.pt"),
-        )
+        if epoch%20==0:
+            torch.save(
+                model.state_dict(),
+                os.path.join(PT_OUT_DIR, f"model_epoch_{epoch}.pt"),
+            )
 
         # Save best model
         if valid_batches > 0 and avg_loss < best_loss:
@@ -203,3 +204,4 @@ BATCH_SIZE = {BATCH_SIZE}
 
 if __name__ == "__main__":
     main()
+
