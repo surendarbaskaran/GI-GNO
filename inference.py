@@ -74,8 +74,7 @@ model = GAGNO(
     grid_size=GRID_SIZE,
 ).to(DEVICE)
 
-model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
-model.eval()
+
 
 # -------------------------------------------------
 # NORMALIZATION UTILS (same as preprocessing)
@@ -94,6 +93,8 @@ def normalize(x, mean, std):
 # INFERENCE LOOP
 # -------------------------------------------------
 def main():
+    model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
+    model.eval()
     with torch.no_grad(), open(INFRLOG_FILE, "w") as logf:
         logf.write("==== INFERENCE STARTED ====\n")
 
