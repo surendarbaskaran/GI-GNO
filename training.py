@@ -34,8 +34,8 @@ from  config import *
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # NUM_WORKERS = min(8, os.cpu_count())
 
-os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(PT_OUT_DIR, exist_ok=True)
+os.makedirs(f"{PT_OUT_DIR}/bestmodel", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
 
 # -------------------------------------------------
@@ -186,7 +186,7 @@ BATCH_SIZE = {BATCH_SIZE}
         # Save epoch model
         torch.save(
             model.state_dict(),
-            os.path.join(OUT_DIR, f"model_epoch_{epoch}.pt"),
+            os.path.join(PT_OUT_DIR, f"model_epoch_{epoch}.pt"),
         )
 
         # Save best model
@@ -194,13 +194,12 @@ BATCH_SIZE = {BATCH_SIZE}
             best_loss = avg_loss
             torch.save(
                 model.state_dict(),
-                os.path.join(OUT_DIR, "best_model.pt"),
+                os.path.join(PT_OUT_DIR, "bestmodel/best_model.pt"),
             )
             log(f"✓ New BEST model | Loss: {best_loss:.6e}")
 
     log("==== TRAINING COMPLETED ====")
 
 
-# if __name__ == "__main__":
-#     main()
-
+if __name__ == "__main__":
+    main()

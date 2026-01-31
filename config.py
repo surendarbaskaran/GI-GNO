@@ -14,7 +14,7 @@ NO_CASES=9
 
 ###### Training
 DATA_DIR = "ptfiles"
-OUT_DIR = "output"
+PT_OUT_DIR = "checkpoints"
 NODE_IN_DIM = 18
 HIDDEN_DIM = 32
 OUT_DIM = 1
@@ -22,7 +22,7 @@ NUM_GNN_LAYERS = 5
 GRID_SIZE = (1024, 512)
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
-EPOCHS = 300
+EPOCHS = 500
 BATCH_SIZE = 1
 USE_SMOOTHNESS_LOSS = False   # enable later if needed
 SMOOTHNESS_WEIGHT = 0.05
@@ -36,7 +36,7 @@ min_modes=16
 max_modes=32
 
 ####### Inference 
-TEST_VTK_DIR = "test"
+TEST_VTK_DIR = "dataset/testvtk"
 OUT_VTK_DIR = "predicted"
-CHECKPOINT = "output/best_model.pt"
+CHECKPOINT = "checkpoints/best_model.pt"
 INFRLOG_FILE = "logs/inference_log.txt"
