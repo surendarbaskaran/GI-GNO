@@ -1,4 +1,4 @@
-myenv/*
+myvenv/*
 logs/
 predicted/
 ptfiles
