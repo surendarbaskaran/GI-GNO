@@ -31,15 +31,15 @@ def main():
 
     print("Starting training pipeline...\n")
 
-    pipeline_start=time.time()
+    start=time.time()
 
     preprocessing.main()
     training.main()
     inference.main()
 
-    time_=time.time()-pipeline_start
+    elapsed = time.time() - start
 
-    print(f"script completed , time taken : {time:.2f} sec")
+    print(f"script completed , time taken : {elapsed:.2f} sec")
 
 
 if __name__ == "__main__":
