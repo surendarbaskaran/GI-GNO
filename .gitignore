@@ -2,3 +2,4 @@ myvenv/*
 logs/
 predicted/
 ptfiles
+__pycache__
