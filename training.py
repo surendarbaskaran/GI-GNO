@@ -35,6 +35,8 @@ from  config import *
 # NUM_WORKERS = min(8, os.cpu_count())
 
 os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs("logs", exist_ok=True)
 
 # -------------------------------------------------
 # LOGGING
@@ -201,3 +203,4 @@ BATCH_SIZE = {BATCH_SIZE}
 
 # if __name__ == "__main__":
 #     main()
+
