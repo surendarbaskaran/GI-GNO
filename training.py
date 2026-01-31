@@ -1,259 +1,203 @@
-# train_ddp.py - Parallel GPU Training with PyTorch DDP (Multi-GPU)
 import os
 import time
-import logging
-from tqdm import tqdm
-
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+import torch.nn.functional as F
+from torch.amp import autocast
 
-from torch.cuda.amp import autocast, GradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-from dataset import GraphDataset
 from model import GAGNO
-from config import *
+from  config import *
+# -------------------------------------------------
+# CONFIG (fixed inside file)
+# -------------------------------------------------
+# DATA_DIR = "ptfiles"
+# OUT_DIR = "output"
 
-import subprocess
+# NODE_IN_DIM = 18
+# HIDDEN_DIM = 32
+# OUT_DIM = 1
+# NUM_GNN_LAYERS = 5
 
-def usage():
-  out = subprocess.check_output([
-      "nvidia-smi",
-      "--query-gpu=utilization.gpu,utilization.memory",
-      "--format=csv,noheader,nounits"
-  ]).decode().strip()
+# GRID_SIZE = (1024, 512)
+# LR = 1e-4
+# WEIGHT_DECAY = 1e-5
+# EPOCHS = 300
+# BATCH_SIZE = 1
 
-  gpu_util, mem_util = map(int, out.split(","))
-  print("GPU Util %:", gpu_util)
-  print("Mem Util %:", mem_util)
+# USE_SMOOTHNESS_LOSS = False   # enable later if needed
+# SMOOTHNESS_WEIGHT = 0.05
+# TRAINING_LOG_FILE = f"log_e{EPOCHS}.txt"
 
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# NUM_WORKERS = min(8, os.cpu_count())
 
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# ----------------------------
-# Logging
-# ----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-# ----------------------------
-# Utils
-# ----------------------------
-def is_main_process():
-    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-
-
-def setup_distributed():
-    """
-    Initializes torch.distributed ONLY if launched via torchrun.
-    If not launched via torchrun, returns None (single-process mode).
-    """
-    if "RANK" not in os.environ:
-        return None  # not a distributed run
-
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
+# -------------------------------------------------
+# LOGGING
+# -------------------------------------------------
+def log(msg):
+    print(msg)
+    with open(TRAINING_LOG_FILE, "a") as f:
+        f.write(msg + "\n")
 
 
+# -------------------------------------------------
+# DATASET
+# -------------------------------------------------
+class GraphDataset(torch.utils.data.Dataset):
+    def __init__(self, root):
+        self.files = sorted(
+            [os.path.join(root, f) for f in os.listdir(root) if f.endswith(".pt")]
+        )
 
-def cleanup_distributed():
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        raw = torch.load(self.files[idx], map_location="cpu", weights_only=True)
+
+        data = Data(
+            x=raw["x"],                          # FP16
+            edge_index=raw["edge_index"],        # int64
+            pos=raw["coords_2d"],                # FP16
+            y_cp=raw["y_cp"].float(),            # FP32 (important)
+        )
+        data.meta = raw["meta"]
+        return data
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, loss, best_loss):
-    # model may be wrapped by DDP -> use .module
-    raw_model = model.module if hasattr(model, "module") else model
-    path = f"{CHECKPOINT_DIR}/model_epoch_{epoch}.pt"
-
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state": raw_model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scaler_state": scaler.state_dict(),
-            "loss": loss,
-            "best_loss": best_loss,
-        },
-        path,
-    )
-    logger.info(f"✓ Saved checkpoint: {path}")
+# -------------------------------------------------
+# OPTIONAL: SMOOTHNESS LOSS (mesh gradient penalty)
+# -------------------------------------------------
+def smoothness_loss(pred, edge_index):
+    src, dst = edge_index
+    return F.mse_loss(pred[src], pred[dst])
 
 
-# ----------------------------
-# Train
-# ----------------------------
-def train_ddp():
-    # CUDA perf flags
+# -------------------------------------------------
+# TRAIN
+# -------------------------------------------------
+def main():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available!")
+    log("==== TRAINING STARTED ====")
+    log(f"Device: {DEVICE}")
+    log("AMP: autocast only (FFT-safe)")
+    log(f"""
+NODE_IN_DIM = {NODE_IN_DIM}
+HIDDEN_DIM = {HIDDEN_DIM}
+OUT_DIM = {OUT_DIM}
+NUM_GNN_LAYERS = {NUM_GNN_LAYERS}
+GRID_SIZE = {GRID_SIZE}
+LR = {LR}
+WEIGHT_DECAY = {WEIGHT_DECAY}
+EPOCHS = {EPOCHS}
+BATCH_SIZE = {BATCH_SIZE}
+""")
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-    # ---- init DDP
-    local_rank = setup_distributed()
-
-    if local_rank is None:
-        # normal single GPU training (your original flow)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(f"cuda:{local_rank}")
-
-    # ---- dataset
-    dataset = GraphDataset(r"data/train")
-
-    # IMPORTANT: DistributedSampler splits dataset per GPU (no duplication)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=dist.get_rank(),
-        shuffle=True,
-        drop_last=False,
-    )
-
-    # DataLoader: each GPU gets different batches
+    dataset = GraphDataset(DATA_DIR)
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
-        sampler=sampler,          # <-- key change for DDP
-        num_workers=2,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
     )
 
-    # ---- model
     model = GAGNO(
-        NODE_IN_DIM,
-        HIDDEN_DIM,
-        OUT_DIM,
-        NUM_LAYERS,
-    ).to(device)
+        node_in_dim=NODE_IN_DIM,
+        hidden_dim=HIDDEN_DIM,
+        out_dim=OUT_DIM,
+        num_gnn_layers=NUM_GNN_LAYERS,
+        grid_size=GRID_SIZE,
+    ).to(DEVICE)
 
-    # torch.compile is optional; in DDP sometimes works, sometimes not
-    # (keeping it safe & optional)
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        if is_main_process():
-            logger.info("Model compiled with torch.compile")
-    except Exception as e:
-        if is_main_process():
-            logger.warning(f"torch.compile not available / failed: {e}")
-
-    # Wrap with DDP
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    # ---- optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LR,
         weight_decay=WEIGHT_DECAY,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
-        eta_min=LR * 0.01,
-    )
-
-    criterion = nn.MSELoss()
-    scaler = GradScaler()
+    # Huber is more stable than MSE for Cp
+    criterion = nn.SmoothL1Loss(beta=1.0)
 
     best_loss = float("inf")
 
-    if is_main_process():
-        logger.info("Starting DDP training...")
-
     for epoch in range(1, EPOCHS + 1):
-        epoch_start = time.time()
-
-        # IMPORTANT: set epoch for sampler so shuffling is different each epoch
-        sampler.set_epoch(epoch)
-        torch.autograd.set_detect_anomaly(True)
         model.train()
-        usage()
-        total_loss = 0.0
+        epoch_loss = 0.0
+        valid_batches = 0
+        start = time.time()
 
-        # show progress bar only on rank0
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", disable=not is_main_process())
-
-        for batch_idx, data in enumerate(pbar):
-            data = data.to(device, non_blocking=True)
-
+        for bidx, data in enumerate(loader):
+            data = data.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
-            # with autocast():
-            print("*"*30)
-            print("target y_cp :",data.y_cp)
-            print("*"*30)
-            pred_cp = model(data)
-            loss = criterion(pred_cp, data.y_cp)
+            with autocast("cuda", dtype=torch.float16):
+                pred = model(data)
+                loss = criterion(pred, data.y_cp)
+
+                if USE_SMOOTHNESS_LOSS:
+                    loss = loss + SMOOTHNESS_WEIGHT * smoothness_loss(
+                        pred, data.edge_index
+                    )
+
+            # ---- NaN / Inf guard (critical) ----
+            if not torch.isfinite(loss):
+                log(f"[Epoch {epoch} | Batch {bidx}] Skipped (NaN/Inf loss)")
+                continue
+
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            # scaler.scale(loss).backward()
 
-            # gradient clipping
-            # scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            epoch_loss += loss.item()
+            valid_batches += 1
 
-            # scaler.step(optimizer)
-            # scaler.update()
-
-            total_loss += loss.item()
-
-            if is_main_process():
-                pbar.set_postfix({"loss": float(loss.item())})
-
-        scheduler.step()
-
-        # ---- DDP: average loss across all ranks
-        loss_tensor = torch.tensor(total_loss / len(loader), device=device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        avg_loss_all = (loss_tensor / dist.get_world_size()).item()
-
-        epoch_time = time.time() - epoch_start
-
-        if is_main_process():
-            logger.info(
-                f"Epoch [{epoch}/{EPOCHS}] | "
-                f"Loss: {avg_loss_all:.6f} | "
-                f"Time: {epoch_time:.2f}s | "
-                f"LR: {scheduler.get_last_lr()[0]:.6f}"
+            log(
+                f"[Epoch {epoch} | Batch {bidx}] "
+                f"Loss: {loss.item():.6e}"
             )
 
-            # Save best model only from rank0
-            if avg_loss_all < best_loss:
-                best_loss = avg_loss_all
-                raw_model = model.module
-                torch.save(raw_model.state_dict(), f"{CHECKPOINT_DIR}/best_model.pt")
-                logger.info(f"✓ New best model saved! Loss: {best_loss:.6f}")
+        if valid_batches > 0:
+            avg_loss = epoch_loss / valid_batches
+        else:
+            avg_loss = float("nan")
 
-            if epoch % SAVE_EVERY == 0:
-                save_checkpoint(model, optimizer, scaler, epoch, avg_loss_all, best_loss)
+        elapsed = time.time() - start
 
-    # Save final model from rank0
-    if is_main_process():
-        raw_model = model.module
-        torch.save(raw_model.state_dict(), f"{CHECKPOINT_DIR}/final_model.pt")
-        logger.info("✅ Training complete, final model saved")
+        log(
+            f"Epoch {epoch} DONE | "
+            f"Avg Loss: {avg_loss:.6e} | "
+            f"Valid: {valid_batches} | "
+            f"Time: {elapsed:.2f}s"
+        )
 
-    cleanup_distributed()
+        # Save epoch model
+        torch.save(
+            model.state_dict(),
+            os.path.join(OUT_DIR, f"model_epoch_{epoch}.pt"),
+        )
+
+        # Save best model
+        if valid_batches > 0 and avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(
+                model.state_dict(),
+                os.path.join(OUT_DIR, "best_model.pt"),
+            )
+            log(f"✓ New BEST model | Loss: {best_loss:.6e}")
+
+    log("==== TRAINING COMPLETED ====")
 
 
-if __name__ == "__main__":
-    start = time.time()
-    train_ddp()
-    end = time.time()
-
-    # This is printed per-process; only rank0 should show cleanly
-    if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
-        logger.info(f"Total training time: {(end - start) / 60:.2f} minutes")
+# if __name__ == "__main__":
+#     main()

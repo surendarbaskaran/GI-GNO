@@ -1,22 +1,42 @@
 # config.py
 
 import torch
+import os
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Model
-NODE_IN_DIM = 17        # depends on your preprocessing
-EDGE_IN_DIM = 4        # optional
+##### Preprocessing
+RAW_VTK_DIR = r"dataset/trainvtk"
+GEOM_PARAM_FILE = r"dataset/geom_params.ini"
+CASE_FILE = r"dataset/case_data.dat"
+OUT_DIR = r"ptfiles"
+NO_CASES=9
+
+###### Training
+DATA_DIR = "ptfiles"
+OUT_DIR = "output"
+NODE_IN_DIM = 18
 HIDDEN_DIM = 32
-OUT_DIM = 1            # Cp / pressure scalar
-
-NUM_LAYERS = 2
-
-# Training
-LR = 1e-3
+OUT_DIM = 1
+NUM_GNN_LAYERS = 5
+GRID_SIZE = (1024, 512)
+LR = 1e-4
 WEIGHT_DECAY = 1e-5
-EPOCHS = 5#200
-BATCH_SIZE = 1         # usually 1 for large meshes
+EPOCHS = 300
+BATCH_SIZE = 1
+USE_SMOOTHNESS_LOSS = False   # enable later if needed
+SMOOTHNESS_WEIGHT = 0.05
+TRAINING_LOG_FILE = f"logs/train_log_e{EPOCHS}.txt"
+NUM_WORKERS = min(8, os.cpu_count())
 
-SAVE_EVERY = 1
-CHECKPOINT_DIR = "checkpoints/"
+###### Model 
+##SpectralConv2d
+modes_ratio=0.025,
+min_modes=16
+max_modes=32
+
+####### Inference 
+TEST_VTK_DIR = "test"
+OUT_VTK_DIR = "predicted"
+CHECKPOINT = "output/best_model.pt"
+INFRLOG_FILE = "logs/inference_log.txt"
