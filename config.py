@@ -38,5 +38,6 @@ max_modes=32
 ####### Inference 
 TEST_VTK_DIR = "dataset/testvtk"
 OUT_VTK_DIR = "predicted"
-CHECKPOINT = "checkpoints/best_model.pt"
+CHECKPOINT = "checkpoints/bestmodel/best_model.pt"
+
 INFRLOG_FILE = "logs/inference_log.txt"
