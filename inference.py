@@ -76,15 +76,6 @@ model = GAGNO(
 
 
 
-# -------------------------------------------------
-# NORMALIZATION UTILS (same as preprocessing)
-# -------------------------------------------------
-def compute_norm_stats(x):
-    mean = x.mean(dim=0)
-    std = torch.clamp(x.std(dim=0), min=1e-6)
-    return mean, std
-
-
 def normalize(x, mean, std):
     return (x - mean) / std
 
@@ -95,6 +86,11 @@ def normalize(x, mean, std):
 def main():
     model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
     model.eval()
+    norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu", weights_only=True)
+    x_mean = norm_stats["x_mean"].float()
+    x_std = norm_stats["x_std"].float()
+    cp_mean = norm_stats["cp_mean"].float()
+    cp_std = norm_stats["cp_std"].float()
     with torch.no_grad(), open(INFRLOG_FILE, "w") as logf:
         logf.write("==== INFERENCE STARTED ====\n")
 
@@ -149,7 +145,6 @@ def main():
             # NODE FEATURES (same as preprocessing)
             # -----------------------------
             x_fp32 = torch.cat([vertices, flow_params, geom_params], dim=1)
-            x_mean, x_std = compute_norm_stats(x_fp32)
             x = normalize(x_fp32, x_mean, x_std).float()
 
             # -----------------------------
@@ -183,7 +178,7 @@ def main():
             # -----------------------------
             # DE-NORMALIZE PREDICTION
             # -----------------------------
-            cp_pred = cp_pred_norm * cp_true.std() + cp_true.mean()
+            cp_pred = cp_pred_norm * cp_std + cp_mean
 
             # -----------------------------
             # ERROR METRICS

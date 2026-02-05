@@ -25,18 +25,36 @@ from  config import *
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# -----------------------------
-# NORMALIZATION UTILS
-# -----------------------------
-def compute_norm_stats(x: torch.Tensor):
-    """
-    x : [N, D] FP32
-    returns mean, std in FP32
-    """
-    mean = x.mean(dim=0)
-    std = x.std(dim=0)
-    std = torch.clamp(std, min=1e-6)
-    return mean, std
+class RunningStats:
+    def __init__(self, num_features: int):
+        self.n = 0
+        self.mean = torch.zeros(num_features, dtype=torch.float32)
+        self.m2 = torch.zeros(num_features, dtype=torch.float32)
+
+    def update(self, x: torch.Tensor):
+        if x.numel() == 0:
+            return
+        batch_n = x.shape[0]
+        batch_mean = x.mean(dim=0)
+        batch_m2 = ((x - batch_mean) ** 2).sum(dim=0)
+
+        if self.n == 0:
+            self.n = batch_n
+            self.mean = batch_mean
+            self.m2 = batch_m2
+            return
+
+        delta = batch_mean - self.mean
+        total = self.n + batch_n
+        self.mean = self.mean + delta * (batch_n / total)
+        self.m2 = self.m2 + batch_m2 + (delta ** 2) * (self.n * batch_n / total)
+        self.n = total
+
+    def finalize(self):
+        denom = max(self.n - 1, 1)
+        var = self.m2 / denom
+        std = torch.sqrt(torch.clamp(var, min=1e-12))
+        return self.mean, std
 
 
 def normalize(x, mean, std):
@@ -44,20 +62,14 @@ def normalize(x, mean, std):
 
 
 # -----------------------------
-# PREPROCESS SINGLE CASE
-# -----------------------------
-def preprocess_case(row, geom_config):
+def build_case_tensors(row, geom_config):
     case_name = row[0]
     geom_name = row[1]
 
     vtk_path = os.path.join(RAW_VTK_DIR, f"{case_name}.vtk")
-    out_path = os.path.join(OUT_DIR, f"{case_name}.pt")
-
     if not os.path.exists(vtk_path):
         print(f"[SKIP] Missing VTK: {case_name}")
-        return
-
-    print(f"[PROCESS] {case_name}")
+        return None
 
     mesh = pv.read(vtk_path)
     mesh = mesh.connectivity(extraction_mode="largest")
@@ -109,8 +121,8 @@ def preprocess_case(row, geom_config):
         [vertices, flow_params, geom_params], dim=1
     )  # [N, 17]
 
-    x_mean, x_std = compute_norm_stats(x_fp32)
-    x_norm = normalize(x_fp32, x_mean, x_std).half()  # FP16
+    # keep FP32 for global stats / normalization later
+    x_norm = None
 
     # -----------------------------
     # NORMALIZED 2D COORDS (for grid)
@@ -131,26 +143,49 @@ def preprocess_case(row, geom_config):
         y_cp_fp32 = torch.tensor(
             mesh.point_data["cp"], dtype=torch.float32
         ).unsqueeze(1)
+    else:
+        y_cp_fp32 = None
 
-        y_cp_mean, y_cp_std = compute_norm_stats(y_cp_fp32)
-        y_cp = normalize(y_cp_fp32, y_cp_mean, y_cp_std)
+    return {
+        "case_name": case_name,
+        "x_fp32": x_fp32,
+        "coords_2d": coords_2d,
+        "edge_index": edge_index,
+        "y_cp_fp32": y_cp_fp32,
+        "meta": {"CL": row[7], "CD": row[8], "CM": row[9]},
+    }
+
+
+# -----------------------------
+# PREPROCESS SINGLE CASE
+# -----------------------------
+def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
+    case_name = case_pack["case_name"]
+    out_path = os.path.join(OUT_DIR, f"{case_name}.pt")
+
+    print(f"[PROCESS] {case_name}")
+    x_norm = normalize(case_pack["x_fp32"], x_mean, x_std).half()
+
+    y_cp = None
+    if case_pack["y_cp_fp32"] is not None:
+        y_cp = normalize(case_pack["y_cp_fp32"], cp_mean, cp_std)
 
     # -----------------------------
     # SAVE
     # -----------------------------
     data = {
-        "x": x_norm,                 # FP16
-        "edge_index": edge_index,    # int64
-        "coords_2d": coords_2d,       # FP16
-        "y_cp": y_cp,                # FP32 or None
+        "x": x_norm,                         # FP16
+        "edge_index": case_pack["edge_index"],  # int64
+        "coords_2d": case_pack["coords_2d"], # FP16
+        "y_cp": y_cp,                        # FP32 or None
         "meta": {
-            "x_mean": x_mean,        # FP32
-            "x_std": x_std,          # FP32
-            "y_cp_mean": y_cp_mean,  # FP32 or None
-            "y_cp_std": y_cp_std,    # FP32 or None
-            "CL": row[7],
-            "CD": row[8],
-            "CM": row[9],
+            "x_mean": x_mean,             # FP32 (global)
+            "x_std": x_std,               # FP32 (global)
+            "y_cp_mean": cp_mean,         # FP32 (global)
+            "y_cp_std": cp_std,           # FP32 (global)
+            "CL": case_pack["meta"]["CL"],
+            "CD": case_pack["meta"]["CD"],
+            "CM": case_pack["meta"]["CM"],
         },
     }
 
@@ -166,13 +201,49 @@ def main():
 
     geom_config = configparser.ConfigParser()
     geom_config.read(GEOM_PARAM_FILE)
-    count=0
-
+    count = 0
+    rows = []
     for _, row in df.iterrows():
-        preprocess_case(row, geom_config)
-        if count>NO_CASES:  #       Remove these lines 
-          break             #       while running full dataset if required
-        count+=1            #       used these lines to limit the steps
+        rows.append(row)
+        if count > NO_CASES:  # Remove these lines while running full dataset if required
+            break
+        count += 1
+
+    # -----------------------------
+    # GLOBAL STATS (train only)
+    # -----------------------------
+    x_stats = RunningStats(num_features=NODE_IN_DIM)
+    cp_stats = RunningStats(num_features=1)
+    case_packs = []
+
+    for row in rows:
+        pack = build_case_tensors(row, geom_config)
+        if pack is None:
+            continue
+        case_packs.append(pack)
+        x_stats.update(pack["x_fp32"])
+        if pack["y_cp_fp32"] is not None:
+            cp_stats.update(pack["y_cp_fp32"])
+
+    x_mean, x_std = x_stats.finalize()
+    cp_mean, cp_std = cp_stats.finalize()
+
+    torch.save(
+        {
+            "x_mean": x_mean,
+            "x_std": x_std,
+            "cp_mean": cp_mean,
+            "cp_std": cp_std,
+        },
+        NORM_STATS_FILE,
+    )
+    print(f"[OK] Saved normalization stats -> {NORM_STATS_FILE}")
+
+    # -----------------------------
+    # PER-CASE SAVE
+    # -----------------------------
+    for pack in case_packs:
+        preprocess_case(pack, x_mean, x_std, cp_mean, cp_std)
 
 
 # if __name__ == "__main__":

@@ -10,7 +10,8 @@ RAW_VTK_DIR = r"dataset/trainvtk"
 GEOM_PARAM_FILE = r"dataset/geom_params.ini"
 CASE_FILE = r"dataset/case_data.dat"
 OUT_DIR = r"ptfiles"
-NO_CASES=9
+NO_CASES = 9
+NORM_STATS_FILE = os.path.join(OUT_DIR, "normalization_stats.pt")
 
 ###### Training
 DATA_DIR = "ptfiles"

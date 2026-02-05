@@ -51,6 +51,39 @@ def log(msg):
         f.write(msg + "\n")
 
 
+class RunningStats:
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x: torch.Tensor):
+        if x.numel() == 0:
+            return
+        x = x.detach().float().view(-1)
+        batch_n = x.numel()
+        batch_mean = x.mean().item()
+        batch_m2 = ((x - batch_mean) ** 2).sum().item()
+
+        if self.n == 0:
+            self.n = batch_n
+            self.mean = batch_mean
+            self.m2 = batch_m2
+            return
+
+        delta = batch_mean - self.mean
+        total = self.n + batch_n
+        self.mean = self.mean + delta * (batch_n / total)
+        self.m2 = self.m2 + batch_m2 + (delta ** 2) * (self.n * batch_n / total)
+        self.n = total
+
+    def std(self):
+        if self.n < 2:
+            return 0.0
+        var = self.m2 / (self.n - 1)
+        return float(var ** 0.5)
+
+
 # -------------------------------------------------
 # DATASET
 # -------------------------------------------------
@@ -109,10 +142,28 @@ BATCH_SIZE = {BATCH_SIZE}
 """)
 
     dataset = GraphDataset(DATA_DIR)
-    loader = DataLoader(
+    val_split = 0.2
+    val_size = max(1, int(len(dataset) * val_split))
+    train_size = max(1, len(dataset) - val_size)
+    train_dataset, val_dataset = torch.utils.data.random_split(
         dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
@@ -137,6 +188,9 @@ BATCH_SIZE = {BATCH_SIZE}
     criterion = nn.SmoothL1Loss(beta=1.0)
 
     best_loss = float("inf")
+    norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu", weights_only=True)
+    cp_mean = norm_stats["cp_mean"].float()
+    cp_std = norm_stats["cp_std"].float()
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -144,14 +198,19 @@ BATCH_SIZE = {BATCH_SIZE}
         valid_batches = 0
         start = time.time()
 
-        for bidx, data in enumerate(loader):
-            global_step = (epoch - 1) * len(loader) + bidx
+        for bidx, data in enumerate(train_loader):
+            global_step = (epoch - 1) * len(train_loader) + bidx
             data = data.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
             with autocast("cuda", dtype=torch.float16):
                 pred = model(data)
-                loss = criterion(pred, data.y_cp)
+                shape_loss = criterion(pred, data.y_cp)
+                loss = (
+                    shape_loss
+                    + 0.1 * (pred.mean() - data.y_cp.mean()) ** 2
+                    + 0.1 * (pred.std() - data.y_cp.std()) ** 2
+                )
 
                 writer.add_scalar("debug/gt_std", data.y_cp.std(), global_step)
                 writer.add_scalar("debug/pred_mean", pred.mean().item(), global_step)
@@ -188,6 +247,46 @@ BATCH_SIZE = {BATCH_SIZE}
         else:
             avg_loss = float("nan")
 
+        # -----------------------------
+        # VALIDATION
+        # -----------------------------
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        pred_stats = RunningStats()
+        final_cp_stats = RunningStats()
+
+        with torch.no_grad():
+            for data in val_loader:
+                data = data.to(DEVICE, non_blocking=True)
+                with autocast("cuda", dtype=torch.float16):
+                    pred = model(data)
+                    shape_loss = criterion(pred, data.y_cp)
+                    vloss = (
+                        shape_loss
+                        + 0.1 * (pred.mean() - data.y_cp.mean()) ** 2
+                        + 0.1 * (pred.std() - data.y_cp.std()) ** 2
+                    )
+
+                val_loss += vloss.item()
+                val_batches += 1
+
+                pred_stats.update(pred)
+                pred_denorm = pred.detach().cpu() * cp_std + cp_mean
+                final_cp_stats.update(pred_denorm)
+
+        if val_batches > 0:
+            val_avg_loss = val_loss / val_batches
+        else:
+            val_avg_loss = float("nan")
+
+        val_pred_std = pred_stats.std()
+        val_final_cp_std = final_cp_stats.std()
+
+        writer.add_scalar("val/loss", val_avg_loss, epoch)
+        writer.add_scalar("val/pred_std", val_pred_std, epoch)
+        writer.add_scalar("val/final_cp_std", val_final_cp_std, epoch)
+
         writer.add_scalar("train/epoch_loss",avg_loss,epoch)
         writer.flush()
         elapsed = time.time() - start
@@ -198,6 +297,15 @@ BATCH_SIZE = {BATCH_SIZE}
             f"Valid: {valid_batches} | "
             f"Time: {elapsed:.2f}s"
         )
+        log(
+            f"Val | Loss: {val_avg_loss:.6e} | "
+            f"Pred Std: {val_pred_std:.6e} | "
+            f"Final Cp Std: {val_final_cp_std:.6e}"
+        )
+
+        if val_pred_std < 1e-4:
+            log(f"[EARLY STOP] pred_std collapsed to {val_pred_std:.6e}")
+            break
 
         # Save epoch model
         if epoch%20==0:
