@@ -11,6 +11,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import GAGNO
 from  config import *
+
+import warnings
+warnings.filterwarnings("ignore") 
 # -------------------------------------------------
 # CONFIG (fixed inside file)
 # -------------------------------------------------
@@ -218,5 +221,6 @@ BATCH_SIZE = {BATCH_SIZE}
 
 if __name__ == "__main__":
     main()
+
 
 
