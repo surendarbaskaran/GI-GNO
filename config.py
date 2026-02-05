@@ -29,6 +29,7 @@ SMOOTHNESS_WEIGHT = 0.05
 TRAINING_LOG_FILE = f"logs/train_log_e{EPOCHS}.txt"
 NUM_WORKERS = min(8, os.cpu_count())
 
+TENSORBOARD="logs/tensorboard/log1"
 ###### Model 
 ##SpectralConv2d
 modes_ratio=0.025,
@@ -41,3 +42,4 @@ OUT_VTK_DIR = "predicted"
 CHECKPOINT = "checkpoints/bestmodel/best_model.pt"
 
 INFRLOG_FILE = "logs/inference_log.txt"
+
