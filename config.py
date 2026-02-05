@@ -11,7 +11,7 @@ GEOM_PARAM_FILE = r"dataset/geom_params.ini"
 CASE_FILE = r"dataset/case_data.dat"
 OUT_DIR = r"ptfiles"
 NO_CASES = 9
-NORM_STATS_FILE = os.path.join(OUT_DIR, "normalization_stats.pt")
+NORM_STATS_FILE = r"normalization_stats.pt"
 
 ###### Training
 DATA_DIR = "ptfiles"
@@ -43,4 +43,5 @@ OUT_VTK_DIR = "predicted"
 CHECKPOINT = "checkpoints/bestmodel/best_model.pt"
 
 INFRLOG_FILE = "logs/inference_log.txt"
+
 
