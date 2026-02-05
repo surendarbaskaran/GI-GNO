@@ -7,6 +7,7 @@ from torch.amp import autocast
 
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from model import GAGNO
 from  config import *
@@ -84,6 +85,7 @@ def smoothness_loss(pred, edge_index):
 # TRAIN
 # -------------------------------------------------
 def main():
+    writer = SummaryWriter(log_dir=TENSORBOARD)
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -140,12 +142,19 @@ BATCH_SIZE = {BATCH_SIZE}
         start = time.time()
 
         for bidx, data in enumerate(loader):
+            global_step = (epoch - 1) * len(loader) + bidx
             data = data.to(DEVICE, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
 
             with autocast("cuda", dtype=torch.float16):
                 pred = model(data)
                 loss = criterion(pred, data.y_cp)
+
+                writer.add_scalar("debug/gt_std", data.y_cp.std(), global_step)
+                writer.add_scalar("debug/pred_mean", pred.mean().item(), global_step)
+                writer.add_scalar("debug/pred_std",  pred.std().item(),  global_step)
+                writer.add_scalar("train/loss", loss, global_step)
+                
 
                 if USE_SMOOTHNESS_LOSS:
                     loss = loss + SMOOTHNESS_WEIGHT * smoothness_loss(
@@ -160,9 +169,11 @@ BATCH_SIZE = {BATCH_SIZE}
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
             epoch_loss += loss.item()
             valid_batches += 1
+            writer.add_scalar("train/loss",loss.item(),global_step)
 
             log(
                 f"[Epoch {epoch} | Batch {bidx}] "
@@ -174,6 +185,8 @@ BATCH_SIZE = {BATCH_SIZE}
         else:
             avg_loss = float("nan")
 
+        writer.add_scalar("train/epoch_loss",avg_loss,epoch)
+        writer.flush()
         elapsed = time.time() - start
 
         log(
@@ -199,9 +212,11 @@ BATCH_SIZE = {BATCH_SIZE}
             )
             log(f"✓ New BEST model | Loss: {best_loss:.6e}")
 
+    writer.close()
     log("==== TRAINING COMPLETED ====")
 
 
 if __name__ == "__main__":
     main()
+
 
