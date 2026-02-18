@@ -18,10 +18,12 @@ class GraphEncoderLayer(MessagePassing):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, edge_index):
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        return self.propagate(edge_index, x=x)
+        out = self.propagate(edge_index, x=x)
+        return self.norm(out)
 
     def message(self, x_i, x_j):
         return self.mlp(torch.cat([x_i, x_j], dim=-1))
@@ -143,12 +145,16 @@ class FNOBlock(nn.Module):
             hidden_dim, hidden_dim, grid_size
         )
         self.pointwise = nn.Conv2d(hidden_dim, hidden_dim, 1)
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x):
         x = torch.clamp(x, -10.0, 10.0)
         x = self.spectral(x) + self.pointwise(x)
         x = F.gelu(x)
-        x = F.dropout(x, p=0.3, training=self.training)
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1)   # [B, H, W, C]
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
         return x
 
 
@@ -179,7 +185,6 @@ class GraphDecoder(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),
             nn.Linear(hidden_dim, out_dim),
         )
 
