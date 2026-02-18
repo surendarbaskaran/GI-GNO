@@ -147,7 +147,9 @@ class FNOBlock(nn.Module):
     def forward(self, x):
         x = torch.clamp(x, -10.0, 10.0)
         x = self.spectral(x) + self.pointwise(x)
-        return F.gelu(x)
+        x = F.gelu(x)
+        x = F.dropout(x, p=0.3, training=self.training)
+        return x
 
 
 ############################################
@@ -177,6 +179,7 @@ class GraphDecoder(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, out_dim),
         )
 
