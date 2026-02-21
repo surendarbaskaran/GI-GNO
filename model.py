@@ -79,15 +79,17 @@ class LatentGridMapper(nn.Module):
         iy = (coords[:, 1] * (W - 1)).long()
         flat_idx = ix * W + iy
 
-        grid_sum = torch.zeros((C, H * W), device=device)
+        
+        dtype = features.dtype
+        grid_sum = torch.zeros((C, H * W), device=device,dtype=dtype)
         grid_sum.scatter_add_(
             1, flat_idx.unsqueeze(0).expand(C, -1), features.T
         )
 
-        grid_count = torch.zeros((1, H * W), device=device)
+        grid_count = torch.zeros((1, H * W), device=device,dtype=dtype)
         grid_count.scatter_add_(
             1, flat_idx.unsqueeze(0),
-            torch.ones_like(flat_idx).unsqueeze(0),
+            torch.ones_like(flat_idx, dtype=dtype, device=device).unsqueeze(0),
         )
 
         grid = grid_sum / (grid_count + 1e-6)
@@ -132,13 +134,22 @@ class SpectralConv2d(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
 
+        # ---- FORCE FP32 FOR FFT ----
+        x = x.float()
+
         x_ft = torch.fft.rfft2(x)
-        weights = torch.complex(self.weights_real, self.weights_imag)
+
+        weights = torch.complex(
+            self.weights_real.float(),
+            self.weights_imag.float()
+        )
 
         x_ft_low = x_ft[:, :, :self.modes1, :self.modes2]
 
         out_ft_low = torch.einsum(
-            "bixy,ioxy->boxy", x_ft_low, weights
+            "bixy,ioxy->boxy",
+            x_ft_low,
+            weights
         )
 
         pad_right = (W // 2 + 1) - self.modes2
@@ -146,7 +157,9 @@ class SpectralConv2d(nn.Module):
 
         out_ft = F.pad(out_ft_low, (0, pad_right, 0, pad_bottom))
 
-        return torch.fft.irfft2(out_ft, s=(H, W))
+        x_out = torch.fft.irfft2(out_ft, s=(H, W))
+
+        return x_out
 
 
 class FNOBlock(nn.Module):
