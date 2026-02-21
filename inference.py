@@ -39,14 +39,7 @@ model = GAGNO(
     dropout=DROPOUT,
 ).to(DEVICE)
 
-model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
-model.eval()
 
-norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu")
-x_mean = norm_stats["x_mean"].float()
-x_std = norm_stats["x_std"].float()
-cp_mean = norm_stats["cp_mean"].float()
-cp_std = norm_stats["cp_std"].float()
 
 
 def normalize(x, mean, std):
@@ -58,6 +51,14 @@ def normalize(x, mean, std):
 ############################################################
 
 def main():
+    model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
+    model.eval()
+
+    norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu")
+    x_mean = norm_stats["x_mean"].float()
+    x_std = norm_stats["x_std"].float()
+    cp_mean = norm_stats["cp_mean"].float()
+    cp_std = norm_stats["cp_std"].float()
 
     with torch.no_grad(), open(INFRLOG_FILE, "w") as logf:
 
