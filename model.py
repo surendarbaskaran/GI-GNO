@@ -5,19 +5,22 @@ import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops
 
-from  config import *
+
 ############################################
 # 1. GRAPH ENCODER
 ############################################
 
 class GraphEncoderLayer(MessagePassing):
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, dropout=0.2):
         super().__init__(aggr="mean")
+
         self.mlp = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
+
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, edge_index):
@@ -30,23 +33,27 @@ class GraphEncoderLayer(MessagePassing):
 
 
 class GraphEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim, num_layers):
+    def __init__(self, in_dim, hidden_dim, num_layers, dropout=0.2):
         super().__init__()
+
         self.input_proj = nn.Linear(in_dim, hidden_dim)
+
         self.layers = nn.ModuleList(
-            [GraphEncoderLayer(hidden_dim) for _ in range(num_layers)]
+            [GraphEncoderLayer(hidden_dim, dropout) for _ in range(num_layers)]
         )
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         x = self.input_proj(x)
+
         for layer in self.layers:
             x = x + layer(x, edge_index)
-        return x  # [N, C]
+
+        return x
 
 
 ############################################
-# 2. LATENT GRID MAPPER (SUM / COUNT)
+# 2. LATENT GRID MAPPER (SMOOTHER VERSION)
 ############################################
 
 class LatentGridMapper(nn.Module):
@@ -56,34 +63,40 @@ class LatentGridMapper(nn.Module):
         self.proj = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, node_features, node_coords):
+        """
+        Assumes node_coords are centered and scaled to [-1, 1]
+        """
         C = node_features.size(1)
         H, W = self.grid_size
         device = node_features.device
 
         features = self.proj(node_features)
 
-        coords = node_coords.clamp(0.0, 1.0)
+        # convert from [-1,1] → [0,1]
+        coords = (node_coords + 1) / 2
+
         ix = (coords[:, 0] * (H - 1)).long()
         iy = (coords[:, 1] * (W - 1)).long()
         flat_idx = ix * W + iy
 
-        grid_sum = torch.zeros((C, H * W), device=device, dtype=features.dtype)
+        grid_sum = torch.zeros((C, H * W), device=device)
         grid_sum.scatter_add_(
             1, flat_idx.unsqueeze(0).expand(C, -1), features.T
         )
 
-        grid_count = torch.zeros((1, H * W), device=device, dtype=features.dtype)
+        grid_count = torch.zeros((1, H * W), device=device)
         grid_count.scatter_add_(
             1, flat_idx.unsqueeze(0),
-            torch.ones_like(flat_idx, dtype=features.dtype).unsqueeze(0),
+            torch.ones_like(flat_idx).unsqueeze(0),
         )
 
         grid = grid_sum / (grid_count + 1e-6)
+
         return grid.view(1, C, H, W)
 
 
 ############################################
-# 3. SPECTRAL CONV (GRID-AWARE MODES)
+# 3. SPECTRAL CONV (REDUCED MODES)
 ############################################
 
 class SpectralConv2d(nn.Module):
@@ -92,19 +105,16 @@ class SpectralConv2d(nn.Module):
         in_channels,
         out_channels,
         grid_size,
-        modes_ratio=0.025,
-        min_modes=16,
-        max_modes=32,
+        modes_ratio=0.015,
+        min_modes=8,
+        max_modes=20,
     ):
         super().__init__()
+
         H, W = grid_size
 
-        self.modes1 = max(
-            min_modes, min(int(H * modes_ratio), max_modes)
-        )
-        self.modes2 = max(
-            min_modes, min(int(W * modes_ratio), max_modes)
-        )
+        self.modes1 = max(min_modes, min(int(H * modes_ratio), max_modes))
+        self.modes2 = max(min_modes, min(int(W * modes_ratio), max_modes))
 
         self.scale = 1 / (in_channels * out_channels)
 
@@ -121,18 +131,19 @@ class SpectralConv2d(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x = x.float()  # FFT safety
 
         x_ft = torch.fft.rfft2(x)
         weights = torch.complex(self.weights_real, self.weights_imag)
 
         x_ft_low = x_ft[:, :, :self.modes1, :self.modes2]
+
         out_ft_low = torch.einsum(
             "bixy,ioxy->boxy", x_ft_low, weights
         )
 
         pad_right = (W // 2 + 1) - self.modes2
         pad_bottom = H - self.modes1
+
         out_ft = F.pad(out_ft_low, (0, pad_right, 0, pad_bottom))
 
         return torch.fft.irfft2(out_ft, s=(H, W))
@@ -141,64 +152,83 @@ class SpectralConv2d(nn.Module):
 class FNOBlock(nn.Module):
     def __init__(self, hidden_dim, grid_size):
         super().__init__()
+
         self.spectral = SpectralConv2d(
             hidden_dim, hidden_dim, grid_size
         )
+
         self.pointwise = nn.Conv2d(hidden_dim, hidden_dim, 1)
+
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x):
-        x = torch.clamp(x, -10.0, 10.0)
+
         x = self.spectral(x) + self.pointwise(x)
         x = F.gelu(x)
+
+        # LayerNorm over channel dimension
         B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1)   # [B, H, W, C]
+        x = x.permute(0, 2, 3, 1)
         x = self.norm(x)
         x = x.permute(0, 3, 1, 2)
+
         return x
 
 
 ############################################
-# 4. MESH-AWARE DECODER (UPGRADED)
+# 4. GRAPH DECODER WITH BILINEAR SAMPLING
 ############################################
 
 class GraphRefineLayer(MessagePassing):
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, dropout=0.2):
         super().__init__(aggr="mean")
+
         self.mlp = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self.norm = nn.LayerNorm(hidden_dim)
+
     def forward(self, x, edge_index):
-        return self.propagate(edge_index, x=x)
+        out = self.propagate(edge_index, x=x)
+        return self.norm(out)
 
     def message(self, x_i, x_j):
         return self.mlp(torch.cat([x_i, x_j], dim=-1))
 
 
 class GraphDecoder(nn.Module):
-    def __init__(self, hidden_dim, out_dim):
+    def __init__(self, hidden_dim, out_dim, dropout=0.2):
         super().__init__()
-        self.refine = GraphRefineLayer(hidden_dim)
+
+        self.refine = GraphRefineLayer(hidden_dim, dropout)
+
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, grid, node_coords, node_latent, edge_index):
-        _, C, H, W = grid.shape
 
-        coords = node_coords.clamp(0.0, 1.0)
-        ix = (coords[:, 0] * (H - 1)).long()
-        iy = (coords[:, 1] * (W - 1)).long()
+        # node_coords assumed in [-1,1]
+        coords = node_coords.unsqueeze(0).unsqueeze(2)
 
-        grid_feat = grid[0, :, ix, iy].T
+        # Bilinear sampling
+        grid_feat = F.grid_sample(
+            grid,
+            coords,
+            mode="bilinear",
+            align_corners=True,
+        )
+
+        grid_feat = grid_feat.squeeze(0).squeeze(-1).T
 
         x = grid_feat + node_latent
-
         x = x + self.refine(x, edge_index)
 
         return self.mlp(x)
@@ -216,11 +246,12 @@ class GAGNO(nn.Module):
         out_dim,
         num_gnn_layers,
         grid_size=(1024, 512),
+        dropout=0.2,
     ):
         super().__init__()
 
         self.encoder = GraphEncoder(
-            node_in_dim, hidden_dim, num_gnn_layers
+            node_in_dim, hidden_dim, num_gnn_layers, dropout
         )
 
         self.mapper = LatentGridMapper(hidden_dim, grid_size)
@@ -231,13 +262,15 @@ class GAGNO(nn.Module):
             FNOBlock(hidden_dim, grid_size),
         )
 
-        self.decoder = GraphDecoder(hidden_dim, out_dim)
+        self.decoder = GraphDecoder(hidden_dim, out_dim, dropout)
 
     def forward(self, data):
+
         node_latent = self.encoder(data)
+
         grid = self.mapper(node_latent, data.pos)
+
         grid = self.fno(grid)
-        grid = torch.clamp(grid, -5.0, 5.0)
 
         return self.decoder(
             grid, data.pos, node_latent, data.edge_index
