@@ -40,7 +40,38 @@ model = GAGNO(
 ).to(DEVICE)
 
 
+def compute_force_coefficients(mesh, cp_values, alpha_deg):
+    """
+    Compute CL and CD from Cp distribution.
+    """
 
+    alpha = np.deg2rad(alpha_deg)
+
+    # Compute surface
+    surf = mesh.extract_surface()
+    surf = surf.compute_normals(cell_normals=True, point_normals=False)
+
+    areas = surf.compute_cell_sizes()["Area"].values
+    normals = surf.cell_data["Normals"]
+
+    # Average Cp per cell
+    cp_point = cp_values.numpy()
+    cp_cell = cp_point[surf.faces.reshape(-1,4)[:,1:]].mean(axis=1)
+
+    # Force per cell
+    Fx = -cp_cell * normals[:,0] * areas
+    Fy = -cp_cell * normals[:,1] * areas
+    Fz = -cp_cell * normals[:,2] * areas
+
+    # Total force
+    Fx_total = Fx.sum()
+    Fy_total = Fy.sum()
+
+    # Project to lift and drag
+    CD = Fx_total * np.cos(alpha) + Fy_total * np.sin(alpha)
+    CL = -Fx_total * np.sin(alpha) + Fy_total * np.cos(alpha)
+
+    return CL, CD
 
 def normalize(x, mean, std):
     return (x - mean) / std
@@ -158,6 +189,10 @@ def main():
             cp_true = torch.tensor(
                 mesh.point_data["cp"], dtype=torch.float32
             )
+            
+            # ------------------------------
+            # Field Errors
+            # ------------------------------
 
             diff = cp_pred - cp_true
 
@@ -165,16 +200,47 @@ def main():
             rmse = torch.sqrt(torch.mean(diff ** 2)).item()
             mae = torch.mean(torch.abs(diff)).item()
             rel_l2 = (torch.norm(diff) /
-                      (torch.norm(cp_true) + 1e-8)).item()
+                    (torch.norm(cp_true) + 1e-8)).item()
+
+            max_abs_err = torch.max(torch.abs(diff)).item()
+
+            corr = np.corrcoef(
+                cp_true.numpy().flatten(),
+                cp_pred.numpy().flatten()
+            )[0,1]
+
+            # ------------------------------
+            # Force Coefficients
+            # ------------------------------
+
+            alpha_deg = float(row[6])
+
+            CL_true, CD_true = compute_force_coefficients(mesh, cp_true, alpha_deg)
+            CL_pred, CD_pred = compute_force_coefficients(mesh, cp_pred, alpha_deg)
+
+            cl_error = abs(CL_pred - CL_true) / (abs(CL_true) + 1e-8)
+            cd_error = abs(CD_pred - CD_true) / (abs(CD_true) + 1e-8)
+
 
             logf.write(
-                f"\nCase: {case_name}\n"
-                f"MSE  : {mse:.6e}\n"
-                f"RMSE : {rmse:.6e}\n"
-                f"MAE  : {mae:.6e}\n"
-                f"RelL2: {rel_l2:.6e}\n"
-                + "-"*40 + "\n"
-            )
+                        f"\nCase: {case_name}\n"
+                        f"Alpha: {alpha_deg:.2f} deg\n"
+                        f"\n--- Field Errors ---\n"
+                        f"MSE        : {mse:.6e}\n"
+                        f"RMSE       : {rmse:.6e}\n"
+                        f"MAE        : {mae:.6e}\n"
+                        f"Rel L2     : {rel_l2:.6e}\n"
+                        f"Max Abs Err: {max_abs_err:.6e}\n"
+                        f"Correlation: {corr:.6f}\n"
+                        f"\n--- Force Coefficients ---\n"
+                        f"CL_true    : {CL_true:.6e}\n"
+                        f"CL_pred    : {CL_pred:.6e}\n"
+                        f"CL_rel_err : {cl_error:.6e}\n"
+                        f"CD_true    : {CD_true:.6e}\n"
+                        f"CD_pred    : {CD_pred:.6e}\n"
+                        f"CD_rel_err : {cd_error:.6e}\n"
+                        + "-"*50 + "\n"
+                    )
 
             ############################################################
             # SAVE VTK
