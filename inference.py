@@ -213,7 +213,7 @@ def main():
             # Force Coefficients
             # ------------------------------
 
-            alpha_deg = float(row[6])
+            alpha_deg = float(row[5])
 
             CL_true, CD_true = compute_force_coefficients(mesh, cp_true, alpha_deg)
             CL_pred, CD_pred = compute_force_coefficients(mesh, cp_pred, alpha_deg)
