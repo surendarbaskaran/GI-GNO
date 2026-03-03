@@ -1,3 +1,4 @@
+from curses import raw
 import os
 import time
 import torch
@@ -33,15 +34,35 @@ class GraphDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.files)
 
+    # def __getitem__(self, idx):
+    #     raw = torch.load(self.files[idx], map_location="cpu")
+
+    #     data = Data(
+    #         x=raw["x"],                     # FP16
+    #         edge_index=raw["edge_index"],   # int64
+    #         pos=raw["pos"],                 # FP16 in [-1,1]
+    #         y_cp=raw["y_cp"].float(),       # FP32 normalized
+    #     )
+    #     return data
+    
     def __getitem__(self, idx):
         raw = torch.load(self.files[idx], map_location="cpu")
 
         data = Data(
-            x=raw["x"],                     # FP16
-            edge_index=raw["edge_index"],   # int64
-            pos=raw["pos"],                 # FP16 in [-1,1]
-            y_cp=raw["y_cp"].float(),       # FP32 normalized
+            x=raw["x"],
+            edge_index=raw["edge_index"],
+            pos=raw["pos"],
+            y_cp=raw["y_cp"].float(),
         )
+
+        # ADD GEOMETRY INFO FOR FORCE LOSS
+        data.faces = raw["faces"]
+        data.cell_normals = raw["cell_normals"]
+        data.cell_areas = raw["cell_areas"]
+
+        data.CL_true = torch.tensor(raw["meta"]["CL"], dtype=torch.float32)
+        data.CD_true = torch.tensor(raw["meta"]["CD"], dtype=torch.float32)
+
         return data
 
 
@@ -53,6 +74,36 @@ def smoothness_loss(pred, edge_index):
     src, dst = edge_index
     return F.mse_loss(pred[src], pred[dst])
 
+
+
+def compute_force_coefficients(cp_pred, data):
+    """
+    cp_pred: (N_nodes, 1)
+    data: batch element
+    """
+
+    faces = data.faces
+    normals = data.cell_normals
+    areas = data.cell_areas
+
+    # Convert point Cp → cell Cp
+    cp_cell = cp_pred.squeeze()[faces].mean(dim=1)
+
+    # Force per cell
+    Fx = -cp_cell * normals[:, 0] * areas
+    Fy = -cp_cell * normals[:, 1] * areas
+
+    Fx_total = Fx.sum()
+    Fy_total = Fy.sum()
+
+    # alpha must be available — assume already in node features
+    alpha_deg = data.x[0, 5]  # alpha index (adjust if needed)
+    alpha = torch.deg2rad(alpha_deg)
+
+    CD = Fx_total * torch.cos(alpha) + Fy_total * torch.sin(alpha)
+    CL = -Fx_total * torch.sin(alpha) + Fy_total * torch.cos(alpha)
+
+    return CL, CD
 
 ############################################################
 # TRAIN
@@ -145,7 +196,36 @@ def main():
 
             with autocast("cuda", dtype=torch.float16):
                 pred = model(data)
-                loss = criterion(pred, data.y_cp)
+                # --------------------------
+                # FIELD LOSS
+                # --------------------------
+                L_field = criterion(pred, data.y_cp)
+
+                # --------------------------
+                # FORCE LOSS (FULL PRECISION)
+                # --------------------------
+                cp_pred_fp32 = pred.float()
+                cp_true_fp32 = data.y_cp.float()
+
+                CL_pred, CD_pred = compute_force_coefficients(cp_pred_fp32, data)
+                CL_true = data.CL_true.to(DEVICE)
+                CD_true = data.CD_true.to(DEVICE)
+
+                L_CL = (CL_pred - CL_true) ** 2
+                L_CD = (CD_pred - CD_true) ** 2
+
+                # --------------------------
+                # TOTAL LOSS
+                # --------------------------
+                # LAMBDA_FIELD = 1.0
+                # LAMBDA_CL = 0.1
+                # LAMBDA_CD = 0.1
+
+                loss = (
+                    LAMBDA_FIELD * L_field
+                    + LAMBDA_CL * L_CL 
+                    + LAMBDA_CD * L_CD
+                )
 
                 if USE_SMOOTHNESS_LOSS:
                     loss = loss + SMOOTHNESS_WEIGHT * smoothness_loss(
@@ -178,7 +258,37 @@ def main():
 
                 with autocast("cuda", dtype=torch.float16):
                     pred = model(data)
-                    loss = criterion(pred, data.y_cp)
+                    # loss = criterion(pred, data.y_cp)
+                    # --------------------------
+                    # FIELD LOSS
+                    # --------------------------
+                    L_field = criterion(pred, data.y_cp)
+
+                    # --------------------------
+                    # FORCE LOSS (FULL PRECISION)
+                    # --------------------------
+                    cp_pred_fp32 = pred.float()
+                    cp_true_fp32 = data.y_cp.float()
+
+                    CL_pred, CD_pred = compute_force_coefficients(cp_pred_fp32, data)
+                    CL_true = data.CL_true.to(DEVICE)
+                    CD_true = data.CD_true.to(DEVICE)
+
+                    L_CL = (CL_pred - CL_true) ** 2
+                    L_CD = (CD_pred - CD_true) ** 2
+
+                    # --------------------------
+                    # TOTAL LOSS
+                    # --------------------------
+                    LAMBDA_FIELD = 1.0
+                    LAMBDA_CL = 0.1
+                    LAMBDA_CD = 0.1
+
+                    loss = (
+                        LAMBDA_FIELD * L_field
+                        + LAMBDA_CL * L_CL
+                        + LAMBDA_CD * L_CD
+                    )
 
                 val_loss += loss.item()
 

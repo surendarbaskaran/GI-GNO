@@ -44,6 +44,12 @@ DROPOUT = 0.2
 
 TENSORBOARD = f"logs/tensorboard/h{HIDDEN_DIM}_e{EPOCHS}"
 
+### Loss 
+# Force loss weights
+LAMBDA_FIELD=1.0
+LAMBDA_CL = 0.1
+LAMBDA_CD = 0.1
+
 
 ############################################################
 # INFERENCE

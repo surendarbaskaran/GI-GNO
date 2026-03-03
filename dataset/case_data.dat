@@ -1,4 +1,4 @@
-#	case_name	geom_name	alt_kft	Re	M_inf	alpha_deg	beta_deg	CD	CL	CMy
+case_name	geom_name	alt_kft	Re	M_inf	alpha_deg	beta_deg	CD	CL	CMy
 case_5360	geom_536	36.32	12040000.0	0.2054	0.2194	0.0	0.0069627	0.00597896	-0.00263935	
 case_8941	geom_894	31.94	1423000.0	0.2977	-0.3713	0.0	0.0123127	-0.005933	0.00208861	
 case_9874	geom_987	7.05	57210000.0	0.4719	7.656	0.0	0.0118923	0.156838	-0.064051	
