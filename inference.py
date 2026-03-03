@@ -47,27 +47,35 @@ def compute_force_coefficients(mesh, cp_values, alpha_deg):
 
     alpha = np.deg2rad(alpha_deg)
 
-    # Compute surface
-    surf = mesh.extract_surface()
+    # Extract & triangulate surface
+    surf = mesh.extract_surface().triangulate()
+
+    # Compute normals
     surf = surf.compute_normals(cell_normals=True, point_normals=False)
 
-    areas = surf.compute_cell_sizes()["Area"].values
-    normals = surf.cell_data["Normals"]
+    # Compute cell areas
+    surf = surf.compute_cell_sizes()
 
-    # Average Cp per cell
+    # Correct way to get numpy arrays
+    areas = np.array(surf.cell_data["Area"])
+    normals = np.array(surf.cell_data["Normals"])
+
+    # Convert Cp tensor to numpy
     cp_point = cp_values.numpy()
-    cp_cell = cp_point[surf.faces.reshape(-1,4)[:,1:]].mean(axis=1)
+
+    # Faces
+    faces = surf.faces.reshape(-1, 4)[:, 1:]
+
+    # Average Cp per triangle
+    cp_cell = cp_point[faces].mean(axis=1)
 
     # Force per cell
-    Fx = -cp_cell * normals[:,0] * areas
-    Fy = -cp_cell * normals[:,1] * areas
-    Fz = -cp_cell * normals[:,2] * areas
+    Fx = -cp_cell * normals[:, 0] * areas
+    Fy = -cp_cell * normals[:, 1] * areas
 
-    # Total force
     Fx_total = Fx.sum()
     Fy_total = Fy.sum()
 
-    # Project to lift and drag
     CD = Fx_total * np.cos(alpha) + Fy_total * np.sin(alpha)
     CL = -Fx_total * np.sin(alpha) + Fy_total * np.cos(alpha)
 
