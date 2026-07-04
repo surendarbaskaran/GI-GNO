@@ -1,4 +1,5 @@
 myvenv/*
+venv/*
 logs/
 predicted/
 ptfiles

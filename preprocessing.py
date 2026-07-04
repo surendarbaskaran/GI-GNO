@@ -338,9 +338,6 @@ def build_case_tensors(row, geom_config):
 
 def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
 
-    case_name = case_pack["case_name"]
-    out_path = os.path.join(OUT_DIR, f"{case_name}.pt")
-
     # Normalize node features
     x_norm = normalize(case_pack["x_fp32"], x_mean, x_std).half()
 
@@ -370,9 +367,13 @@ def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
         },
     }
 
-    # Save and immediately free
-    torch.save(data, out_path)
-    del data, x_norm, y_cp
+    del x_norm, y_cp
+    return data
+
+
+def save_chunk_cases(cases, chunk_idx):
+    chunk_path = os.path.join(OUT_DIR, f"chunk_{chunk_idx:03d}.pt")
+    torch.save(cases, chunk_path)
 
 
 ############################################
@@ -386,7 +387,8 @@ def main():
     geom_config = configparser.ConfigParser()
     geom_config.read(GEOM_PARAM_FILE)
 
-    rows = df.head(NO_CASES).reset_index(drop=True)
+    rows = df if NO_CASES is None else df.head(NO_CASES)
+    rows = rows.reset_index(drop=True)
     total_cases = len(rows)
 
     ############################################################
@@ -463,6 +465,8 @@ def main():
     print("="*70)
 
     saved_count = 0
+    chunk_cases = []
+    chunk_idx = 0
 
     for idx, (_, row) in enumerate(rows.iterrows(), 1):
         
@@ -471,8 +475,15 @@ def main():
             if pack is None:
                 continue
 
-            preprocess_case(pack, x_mean, x_std, cp_mean, cp_std)
+            chunk_cases.append(
+                preprocess_case(pack, x_mean, x_std, cp_mean, cp_std)
+            )
             saved_count += 1
+
+            if len(chunk_cases) >= CHUNK_SIZE:
+                save_chunk_cases(chunk_cases, chunk_idx)
+                chunk_idx += 1
+                chunk_cases.clear()
 
             # Progress indicator with memory usage
             if idx % 50 == 0:
@@ -490,10 +501,14 @@ def main():
             print(f"[ERROR] Failed to process case {row[0]}: {str(e)}")
             continue
 
+    if chunk_cases:
+        save_chunk_cases(chunk_cases, chunk_idx)
+
     clear_cache()
 
     print("\n" + "="*70)
     print(f"✓ PREPROCESSING COMPLETED SUCCESSFULLY")
     print(f"  Total cases processed: {saved_count}/{total_cases}")
     print(f"  Output directory: {OUT_DIR}")
+    print(f"  Chunk files written: {chunk_idx + (1 if chunk_cases else 0)}")
     print("="*70)

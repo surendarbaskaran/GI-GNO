@@ -90,7 +90,19 @@ def normalize(x, mean, std):
 ############################################################
 
 def main():
-    model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
+    checkpoint = torch.load(CHECKPOINT, map_location=DEVICE)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    elif isinstance(checkpoint, dict) and any(k.startswith("encoder") or k.startswith("decoder") for k in checkpoint.keys()):
+        state_dict = checkpoint
+    else:
+        state_dict = checkpoint
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if incompatible.missing_keys:
+        print(f"[WARN] Missing keys while loading checkpoint: {incompatible.missing_keys[:10]}")
+    if incompatible.unexpected_keys:
+        print(f"[WARN] Unexpected keys while loading checkpoint: {incompatible.unexpected_keys[:10]}")
     model.eval()
 
     norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu")
