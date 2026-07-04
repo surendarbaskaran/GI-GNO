@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 import pyvista as pv
 import configparser
@@ -10,6 +11,23 @@ from config import *
 
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================
+# MEMORY OPTIMIZATION
+# ============================================
+
+def clear_cache():
+    """Aggressively clear GPU and CPU cache"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def get_memory_usage():
+    """Get current memory usage in GB"""
+    import psutil
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 ** 3)
 
 
 ############################################
@@ -182,6 +200,7 @@ def build_case_tensors(row, geom_config):
         print(f"[SKIP] Missing VTK: {case_name}")
         return None
 
+    # Read and process mesh
     mesh = pv.read(vtk_path)
     mesh = mesh.connectivity(extraction_mode="largest")
 
@@ -190,6 +209,8 @@ def build_case_tensors(row, geom_config):
     ########################################################
 
     surf = mesh.extract_surface().triangulate()
+    del mesh  # Free original mesh immediately
+    
     surf = surf.compute_normals(cell_normals=True, point_normals=False)
     surf = surf.compute_cell_sizes()
 
@@ -211,11 +232,12 @@ def build_case_tensors(row, geom_config):
     # FACES (TRIANGLES)
     ########################################################
 
-    faces = surf.faces.reshape(-1, 4)[:, 1:]  # (n_cells, 3)
-    faces = torch.tensor(faces, dtype=torch.long)
+    faces_np = surf.faces.reshape(-1, 4)[:, 1:]  # (n_cells, 3)
+    faces = torch.tensor(faces_np, dtype=torch.long)
+    del faces_np
 
     ########################################################
-    # CELL NORMALS & AREAS
+    # CELL NORMALS & AREAS (OPTIMIZE DTYPE)
     ########################################################
 
     cell_normals = torch.tensor(
@@ -242,6 +264,7 @@ def build_case_tensors(row, geom_config):
     )
 
     edge_index = to_undirected(edges.T)
+    del edges  # Free intermediate
 
     ########################################################
     # GEOMETRY PARAMETERS
@@ -276,6 +299,7 @@ def build_case_tensors(row, geom_config):
         [vertices, flow_params, geom_params],
         dim=1,
     )
+    del geom_params, flow_params  # Free components
 
     ########################################################
     # TARGET Cp
@@ -288,6 +312,8 @@ def build_case_tensors(row, geom_config):
         ).unsqueeze(1)
     else:
         y_cp_fp32 = None
+
+    del surf  # Free mesh object
 
     return {
         "case_name": case_name,
@@ -307,7 +333,7 @@ def build_case_tensors(row, geom_config):
 
 
 ############################################
-# SAVE NORMALIZED CASE
+# SAVE NORMALIZED CASE (MEMORY EFFICIENT)
 ############################################
 
 def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
@@ -315,58 +341,42 @@ def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
     case_name = case_pack["case_name"]
     out_path = os.path.join(OUT_DIR, f"{case_name}.pt")
 
-    print(f"[PROCESS] {case_name}")
-
+    # Normalize node features
     x_norm = normalize(case_pack["x_fp32"], x_mean, x_std).half()
 
+    # Normalize target Cp
     if case_pack["y_cp_fp32"] is not None:
-        y_cp = normalize(
-            case_pack["y_cp_fp32"], cp_mean, cp_std
-        )
+        y_cp = normalize(case_pack["y_cp_fp32"], cp_mean, cp_std)
     else:
         y_cp = None
 
-    # data = {
-    #     "x": x_norm,
-    #     "edge_index": case_pack["edge_index"],
-    #     "pos": case_pack["coords_2d"].half(),   # renamed to match model
-    #     "y_cp": y_cp,
-    #     "meta": {
-    #         "x_mean": x_mean,
-    #         "x_std": x_std,
-    #         "y_cp_mean": cp_mean,
-    #         "y_cp_std": cp_std,
-    #         "CL": case_pack["meta"]["CL"],
-    #         "CD": case_pack["meta"]["CD"],
-    #         "CM": case_pack["meta"]["CM"],
-    #     },
-    # }
-
+    # Build data dictionary
     data = {
-            "x": x_norm,
-            "edge_index": case_pack["edge_index"],
-            "pos": case_pack["coords_2d"].half(),
-            "faces": case_pack["faces"],
-            "cell_normals": case_pack["cell_normals"],
-            "cell_areas": case_pack["cell_areas"],
-            "y_cp": y_cp,
-            "meta": {
-                "x_mean": x_mean,
-                "x_std": x_std,
-                "y_cp_mean": cp_mean,
-                "y_cp_std": cp_std,
-                "CL": case_pack["meta"]["CL"],
-                "CD": case_pack["meta"]["CD"],
-                "CM": case_pack["meta"]["CM"],
-            },
-        }
+        "x": x_norm,
+        "edge_index": case_pack["edge_index"],
+        "pos": case_pack["coords_2d"].half(),
+        "faces": case_pack["faces"],
+        "cell_normals": case_pack["cell_normals"],
+        "cell_areas": case_pack["cell_areas"],
+        "y_cp": y_cp,
+        "meta": {
+            "x_mean": x_mean,
+            "x_std": x_std,
+            "y_cp_mean": cp_mean,
+            "y_cp_std": cp_std,
+            "CL": case_pack["meta"]["CL"],
+            "CD": case_pack["meta"]["CD"],
+            "CM": case_pack["meta"]["CM"],
+        },
+    }
 
+    # Save and immediately free
     torch.save(data, out_path)
-    print(f"[OK] Saved: {out_path}")
+    del data, x_norm, y_cp
 
 
 ############################################
-# MAIN
+# MAIN (MEMORY-EFFICIENT TWO-PASS STREAMING)
 ############################################
 
 def main():
@@ -376,28 +386,57 @@ def main():
     geom_config = configparser.ConfigParser()
     geom_config.read(GEOM_PARAM_FILE)
 
-    rows = df.head(NO_CASES)
+    rows = df.head(NO_CASES).reset_index(drop=True)
+    total_cases = len(rows)
+
+    ############################################################
+    # PASS 1: COMPUTE STATISTICS (NO STORAGE)
+    ############################################################
+    
+    print("\n" + "="*70)
+    print("PASS 1: COMPUTING NORMALIZATION STATISTICS")
+    print("="*70)
+    print(f"Total cases to process: {total_cases}")
 
     x_stats = RunningStats(num_features=NODE_IN_DIM)
     cp_stats = RunningStats(num_features=1)
 
-    case_packs = []
+    processed_count = 0
 
-    for _, row in rows.iterrows():
+    for idx, (_, row) in enumerate(rows.iterrows(), 1):
+        
+        try:
+            pack = build_case_tensors(row, geom_config)
+            if pack is None:
+                continue
 
-        pack = build_case_tensors(row, geom_config)
-        if pack is None:
+            x_stats.update(pack["x_fp32"])
+
+            if pack["y_cp_fp32"] is not None:
+                cp_stats.update(pack["y_cp_fp32"])
+
+            processed_count += 1
+
+            # Progress indicator with memory usage
+            if idx % 50 == 0:
+                mem_usage = get_memory_usage()
+                print(f"  [{idx:5d}/{total_cases}] {processed_count} cases processed | RAM: {mem_usage:.2f} GB")
+            
+            # Explicitly delete to free memory
+            del pack
+            
+            # Periodic garbage collection
+            if idx % 100 == 0:
+                clear_cache()
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to process case {row[0]}: {str(e)}")
             continue
-
-        case_packs.append(pack)
-        x_stats.update(pack["x_fp32"])
-
-        if pack["y_cp_fp32"] is not None:
-            cp_stats.update(pack["y_cp_fp32"])
 
     x_mean, x_std = x_stats.finalize()
     cp_mean, cp_std = cp_stats.finalize()
 
+    # Save statistics
     torch.save(
         {
             "x_mean": x_mean,
@@ -408,7 +447,53 @@ def main():
         NORM_STATS_FILE,
     )
 
-    print(f"[OK] Saved normalization stats → {NORM_STATS_FILE}")
+    print(f"\n[✓] Statistics computed from {processed_count} cases")
+    print(f"[✓] Saved normalization stats → {NORM_STATS_FILE}")
+    print(f"    x_mean shape: {x_mean.shape}")
+    print(f"    cp_mean: {cp_mean.item():.6f}, cp_std: {cp_std.item():.6f}")
 
-    for pack in case_packs:
-        preprocess_case(pack, x_mean, x_std, cp_mean, cp_std)
+    clear_cache()
+
+    ############################################################
+    # PASS 2: NORMALIZE & SAVE (STREAMING)
+    ############################################################
+    
+    print("\n" + "="*70)
+    print("PASS 2: NORMALIZING & SAVING CASES")
+    print("="*70)
+
+    saved_count = 0
+
+    for idx, (_, row) in enumerate(rows.iterrows(), 1):
+        
+        try:
+            pack = build_case_tensors(row, geom_config)
+            if pack is None:
+                continue
+
+            preprocess_case(pack, x_mean, x_std, cp_mean, cp_std)
+            saved_count += 1
+
+            # Progress indicator with memory usage
+            if idx % 50 == 0:
+                mem_usage = get_memory_usage()
+                print(f"  [{idx:5d}/{total_cases}] {saved_count} cases saved | RAM: {mem_usage:.2f} GB")
+            
+            # Explicitly delete to free memory
+            del pack
+            
+            # Periodic garbage collection
+            if idx % 100 == 0:
+                clear_cache()
+
+        except Exception as e:
+            print(f"[ERROR] Failed to process case {row[0]}: {str(e)}")
+            continue
+
+    clear_cache()
+
+    print("\n" + "="*70)
+    print(f"✓ PREPROCESSING COMPLETED SUCCESSFULLY")
+    print(f"  Total cases processed: {saved_count}/{total_cases}")
+    print(f"  Output directory: {OUT_DIR}")
+    print("="*70)
