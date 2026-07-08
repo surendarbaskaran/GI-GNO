@@ -1,243 +1,155 @@
----
+# GI-GNO CFD Inference
 
-# 🧠 GNN-based CFD Inference Pipeline
+This project contains the existing GI-GNO preprocessing, training, model, and
+inference code. The inference path has been refactored into a reusable
+single-geometry engine plus an interactive Gradio application.
 
-This repository contains an **end-to-end pipeline** for preprocessing CFD VTK data, training a **Graph Neural Network (GNN)** model, and running inference to generate predicted Cp fields and evaluation metrics.
+## Project Files
 
-The codebase has been refactored to be **configuration-driven**, modular, and easy to run selectively (preprocess / train / inference).
+| File | Purpose |
+| --- | --- |
+| `preprocessing.py` | Builds graph tensors and normalization statistics from VTK data. |
+| `training.py` | Trains the GI-GNO model. |
+| `model.py` | Defines the GNN/FNO model architecture. |
+| `config.py` | Stores paths, model dimensions, and training settings. |
+| `inference.py` | Loads the model once and runs inference on one uploaded VTK. |
+| `inference_gradio.py` | Gradio web UI for interactive simulation. |
 
----
+## Installation
 
-## 📌 Key Changes & Design Decisions (So Far)
+Install the Python packages listed in `requirements.txt`:
 
-### ✅ 1. Unified Configuration (`config.py`)
+```bash
+pip install -r requirements.txt
+```
 
-All tunable parameters are centralized in **`config.py`**, including:
+The project also requires PyTorch and PyTorch Geometric. Install versions that
+match your CUDA or CPU environment from the official PyTorch and PyG install
+instructions.
 
-* Paths (data, outputs, checkpoints)
-* Model architecture
-* Training hyperparameters
-* Inference options
-* Device selection (CPU / CUDA)
+Required runtime packages include:
 
-This removes hard-coded values from scripts and ensures **single-source-of-truth** configuration.
+```text
+torch
+torch-geometric
+pyvista
+numpy
+gradio
+```
 
----
+## Required Assets
 
-### ✅ 2. Modular Pipeline Structure
-
-The pipeline is split into three explicit stages:
-
-| Stage         | Script             | Purpose                          |
-| ------------- | ------------------ | -------------------------------- |
-| Preprocessing | `preprocessing.py` | Convert VTK → PyTorch graph data |
-| Training      | `training.py`      | Train GNN model                  |
-| Inference     | `inference.py`     | Predict Cp + save VTK + metrics  |
-
-Each stage can be run **independently** or as part of the full pipeline.
-
----
-
-### ✅ 3. Controlled Execution via `start.py`
-
-The `start.py` script acts as the **entry point**.
-
-Users can **comment / uncomment** stages depending on what they want to run:
+Inference reads these paths from `config.py`:
 
 ```python
-def main():
-    print_config(config)
-
-    print("Starting training pipeline...\n")
-
-    pipeline_start = time.time()
-
-    preprocessing.main()
-    training.main()
-    inference.main()
-
-    time_ = time.time() - pipeline_start
-    print(f"script completed , time taken : {time_:.2f} sec")
-
-
-if __name__ == "__main__":
-    main()
+CHECKPOINT = "checkpoints/bestmodel/best_model.pt"
+NORM_STATS_FILE = "normalization_stats.pt"
+GEOM_PARAM_FILE = "dataset/geom_params.ini"
 ```
 
-👉 This avoids multiple CLI commands and keeps execution simple.
+Place the trained checkpoint, normalization statistics, and geometry parameter
+file at those configured paths before launching the app.
 
----
+## Running The Gradio App
 
-### ✅ 4. Robust `case_data.dat` Handling
-
-* Header-aware parsing
-* Explicit column access (no positional indexing)
-* Geometry name correctly mapped to `geom_params.ini`
-* Prevents silent mismatches during inference
-
----
-
-### ✅ 5. Consistent Geometry Parameter Handling
-
-* `geom_params.ini` used consistently across:
-
-  * preprocessing
-  * training
-  * inference
-* Geometry parameters are broadcasted per-node and appended to node features
-
----
-
-### ✅ 6. Dependency Setup Script (`install.sh`)
-
-All required dependencies are installed via:
+From the project root:
 
 ```bash
-bash install.sh
+python inference_gradio.py
 ```
 
-This ensures environment reproducibility.
-
----
-
-## 📁 Repository Structure
-
-```
-.
-├── config.py                 # Central configuration
-├── start.py                  # Pipeline launcher
-├── install.sh                # Dependency installer
-│
-├── preprocessing.py          # VTK → Graph preprocessing
-├── training.py               # Model training
-├── inference.py              # Model inference + metrics
-│
-├── model.py                  # GNN architecture
-├── geom_params.ini           # Geometry parameters
-├── case_data.dat             # Case metadata (with headers)
-│
-├── data/                     # Raw VTK files
-├── test/                     # Test VTKs for inference
-├── ptfiles/                  # Preprocessed graph data
-├── output/                   # Model checkpoints
-└── predicted/                # Inference output VTKs
-```
-
----
-
-## ⚙️ Installation
-
-### 1️⃣ Clone the repository
-
-```bash
-git clone <repo_url>
-cd <repo_name>
-```
-
-### 2️⃣ Install dependencies
-
-```bash
-bash install.sh
-```
-
----
-
-## 🚀 Running the Pipeline
-
-### 🔹 Option A: Run Full Pipeline
-
-Make sure all stages are **uncommented** in `start.py`:
+Open the local URL printed by Gradio. In Google Colab, launch with sharing if
+needed:
 
 ```python
-preprocessing.main()
-training.main()
-inference.main()
+from inference_gradio import build_app
+
+build_app().launch(share=True)
 ```
 
-Then run:
+## Google Colab Setup
 
-```bash
-python start.py
+1. Upload or clone the project into Colab.
+2. Install dependencies.
+3. Upload the trained checkpoint to the path set by `CHECKPOINT`.
+4. Upload `normalization_stats.pt` to the path set by `NORM_STATS_FILE`.
+5. Upload `geom_params.ini` to the path set by `GEOM_PARAM_FILE`.
+6. Run the Gradio launch cell.
+
+The app writes predictions and reports to:
+
+```text
+/tmp/output
 ```
 
----
+## How To Upload A VTK
 
-### 🔹 Option B: Run Only Specific Stages
+Use the **Upload Geometry** section of the Gradio page and choose a `.vtk` file.
+The uploaded mesh is processed with the same centering, scaling, graph
+construction, feature ordering, normalization, prediction, and Cp
+denormalization used by the original inference pipeline.
 
-Edit `start.py` and comment out unwanted steps.
+## How To Enter JSON Inputs
 
-#### Example: Inference only
+The reusable Python function accepts flow parameters as a dictionary:
 
 ```python
-# preprocessing.main()
-# training.main()
-inference.main()
+run_inference(
+    vtk_path="example.vtk",
+    input_json={
+        "geom_name": "BWB_047",
+        "alt_kft": 20,
+        "Re": 17000000,
+        "M_inf": 0.28,
+        "alpha_deg": 5,
+        "beta_deg": 0,
+    },
+)
 ```
 
-Then:
+In the Gradio app, enter the same values in the vertical flow-parameter
+textboxes. The UI builds the dictionary internally.
 
-```bash
-python start.py
+## How To Run Simulation
+
+1. Confirm **Model Status** shows the checkpoint, normalization statistics, and
+   geometry config are available.
+2. Upload a `.vtk` geometry.
+3. Enter `geom_name`, `alt_kft`, `Re`, `M_inf`, `alpha_deg`, and `beta_deg`.
+4. Click **Simulate**.
+5. Watch the progress indicator and status message.
+
+Validation checks that the file exists, the extension is `.vtk`, all required
+flow keys are present, numeric values can be parsed, and `geom_name` exists in
+`geom_params.ini`.
+
+## Outputs
+
+After inference, the app saves:
+
+```text
+/tmp/output/predicted_<filename>.vtk
+/tmp/output/simulation_report.txt
 ```
 
----
+The prediction summary displays:
 
-## 🧪 Outputs
+```text
+Vertices
+Faces
+Inference Time
+RMSE
+MAE
+Correlation
+CL
+CD
+```
 
-### ✔ Preprocessing
+If the uploaded VTK contains a `cp` point-data field, error metrics and
+`Cp_error` are generated. If no true `cp` field exists, the app still saves
+`Cp_pred`, and error metrics are shown as `N/A`.
 
-* `.pt` graph files saved to:
+## Downloading Results
 
-  ```
-  ptfiles/
-  ```
-
-### ✔ Training
-
-* Model checkpoints saved to:
-
-  ```
-  output/
-  ```
-
-### ✔ Inference
-
-* Predicted VTK files saved to:
-
-  ```
-  predicted/
-  ```
-* Includes:
-
-  * Predicted Cp
-  * Error fields
-  * Optional inference logs
-
----
-
-## 🛠 Debugging Tips
-
-* Verify `geom_name` exists in `geom_params.ini`
-* Ensure `case_data.dat` headers are intact
-* Confirm VTKs exist for all listed cases
-* Print `case_df.head()` if inference skips cases
-
----
-
-## 📌 Notes / Next Improvements
-
-* CLI argument support (instead of commenting code)
-* Shared data loader utility
-* Automatic validation of case ↔ geometry consistency
-* Multi-GPU / mixed precision training support
-
----
-
-## ✨ Summary
-
-This repo now provides:
-
-* ✅ Clean, configurable pipeline
-* ✅ Reproducible runs
-* ✅ Modular execution
-* ✅ Robust data handling
+Use the download controls at the bottom of the Gradio page to download the
+predicted VTK and the simulation report.
