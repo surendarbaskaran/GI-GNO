@@ -14,16 +14,24 @@ from typing import Any
 import numpy as np
 import pyvista as pv
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
 
 from config import (
     CHECKPOINT,
+    ATTENTION_HEADS,
+    ATTENTION_LOCAL_RADIUS,
+    ATTENTION_MAX_NODES,
+    ATTENTION_QUERY_CHUNK_SIZE,
     DEVICE,
     DROPOUT,
+    EDGE_DIM,
+    FOURIER_BANDS,
     GEOM_PARAM_FILE,
     GRID_SIZE,
     HIDDEN_DIM,
+    KNN_K,
     NODE_IN_DIM,
     NORM_STATS_FILE,
     NUM_GNN_LAYERS,
@@ -62,6 +70,7 @@ class PreparedMesh:
     mesh: pv.DataSet
     vertices: torch.Tensor
     edge_index: torch.Tensor
+    edge_attr: torch.Tensor
     x_fp32: torch.Tensor
     cp_true: torch.Tensor | None
 
@@ -86,7 +95,13 @@ def load_model() -> InferenceState:
         out_dim=OUT_DIM,
         num_gnn_layers=NUM_GNN_LAYERS,
         grid_size=GRID_SIZE,
+        edge_dim=EDGE_DIM,
         dropout=DROPOUT,
+        fourier_bands=FOURIER_BANDS,
+        attention_heads=ATTENTION_HEADS,
+        attention_query_chunk_size=ATTENTION_QUERY_CHUNK_SIZE,
+        attention_max_nodes=ATTENTION_MAX_NODES,
+        attention_local_radius=ATTENTION_LOCAL_RADIUS,
     ).to(device)
 
     checkpoint = torch.load(CHECKPOINT, map_location=device)
@@ -133,7 +148,9 @@ def run_inference(vtk_path: str, input_json: dict[str, Any]) -> dict[str, Any]:
         x = normalize(prepared.x_fp32, state.x_mean, state.x_std)
         data = Data(
             x=x,
+            xyz=prepared.vertices,
             edge_index=prepared.edge_index,
+            edge_attr=prepared.edge_attr,
             pos=prepared.vertices[:, :2],
         ).to(state.device)
 
@@ -290,6 +307,107 @@ def _validate_request(
     return validated
 
 
+def _build_mesh_edges(faces: torch.Tensor) -> torch.Tensor:
+    edges = torch.cat(
+        [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]],
+        dim=0,
+    )
+    return to_undirected(edges.T)
+
+
+def _build_knn_edges(vertices: torch.Tensor, k: int) -> torch.Tensor:
+    num_nodes = vertices.size(0)
+    if num_nodes <= 1 or k <= 0:
+        return torch.empty((2, 0), dtype=torch.long)
+
+    k = min(k, num_nodes - 1)
+    edge_chunks = []
+    chunk_size = 4096
+    for start in range(0, num_nodes, chunk_size):
+        end = min(start + chunk_size, num_nodes)
+        dist = torch.cdist(vertices[start:end], vertices)
+        local = torch.arange(end - start)
+        dist[local, torch.arange(start, end)] = float("inf")
+        nn_idx = dist.topk(k, largest=False).indices
+        src = torch.arange(start, end).unsqueeze(1).expand(-1, k)
+        edge_chunks.append(torch.stack([src.reshape(-1), nn_idx.reshape(-1)], dim=0))
+
+    return to_undirected(torch.cat(edge_chunks, dim=1))
+
+
+def _merge_edge_indices(*edge_indices: torch.Tensor) -> torch.Tensor:
+    edge_index = torch.cat([edge for edge in edge_indices if edge.numel() > 0], dim=1)
+    return torch.unique(edge_index.T, dim=0).T.contiguous()
+
+
+def _compute_edge_attr(vertices: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    src, dst = edge_index
+    rel_xyz = vertices[dst] - vertices[src]
+    distance = torch.linalg.norm(rel_xyz, dim=1, keepdim=True)
+    direction = rel_xyz / (distance + 1e-8)
+    edge_length = distance
+    return torch.cat([edge_length, rel_xyz, distance, direction], dim=1)
+
+
+def _compute_vertex_normals(
+    num_nodes: int,
+    faces: torch.Tensor,
+    cell_normals: torch.Tensor,
+) -> torch.Tensor:
+    vertex_normals = torch.zeros((num_nodes, 3), dtype=torch.float32)
+    repeated_normals = cell_normals.repeat_interleave(3, dim=0)
+    vertex_normals.index_add_(0, faces.reshape(-1), repeated_normals)
+    return F.normalize(vertex_normals, p=2, dim=1, eps=1e-8)
+
+
+def _compute_local_area(
+    num_nodes: int,
+    faces: torch.Tensor,
+    cell_areas: torch.Tensor,
+) -> torch.Tensor:
+    local_area = torch.zeros((num_nodes, 1), dtype=torch.float32)
+    area_share = (cell_areas / 3.0).repeat_interleave(3).unsqueeze(1)
+    local_area.index_add_(0, faces.reshape(-1), area_share)
+    return local_area
+
+
+def _compute_curvature(vertices: torch.Tensor, mesh_edge_index: torch.Tensor) -> torch.Tensor:
+    src, dst = mesh_edge_index
+    neighbor_sum = torch.zeros_like(vertices)
+    neighbor_count = torch.zeros((vertices.size(0), 1), dtype=vertices.dtype)
+    neighbor_sum.index_add_(0, src, vertices[dst])
+    neighbor_count.index_add_(0, src, torch.ones_like(neighbor_count[src]))
+    neighbor_mean = neighbor_sum / (neighbor_count + 1e-8)
+    return torch.linalg.norm(vertices - neighbor_mean, dim=1, keepdim=True)
+
+
+def _compute_edge_length_stats(
+    vertices: torch.Tensor,
+    mesh_edge_index: torch.Tensor,
+) -> torch.Tensor:
+    src, dst = mesh_edge_index
+    lengths = torch.linalg.norm(vertices[dst] - vertices[src], dim=1)
+    num_nodes = vertices.size(0)
+
+    mean = torch.zeros(num_nodes, dtype=vertices.dtype)
+    count = torch.zeros(num_nodes, dtype=vertices.dtype)
+    min_len = torch.full((num_nodes,), float("inf"), dtype=vertices.dtype)
+    max_len = torch.zeros(num_nodes, dtype=vertices.dtype)
+
+    mean.index_add_(0, src, lengths)
+    count.index_add_(0, src, torch.ones_like(lengths))
+    min_len.scatter_reduce_(0, src, lengths, reduce="amin", include_self=True)
+    max_len.scatter_reduce_(0, src, lengths, reduce="amax", include_self=True)
+
+    mean = mean / (count + 1e-8)
+    sq_diff = (lengths - mean[src]) ** 2
+    var = torch.zeros(num_nodes, dtype=vertices.dtype)
+    var.index_add_(0, src, sq_diff)
+    std = torch.sqrt(var / (count + 1e-8) + 1e-12)
+    min_len = torch.where(torch.isfinite(min_len), min_len, torch.zeros_like(min_len))
+    return torch.stack([mean, min_len, max_len, std], dim=1)
+
+
 def _prepare_mesh(
     vtk_path: str,
     input_json: dict[str, Any],
@@ -297,20 +415,37 @@ def _prepare_mesh(
 ) -> PreparedMesh:
     mesh = pv.read(vtk_path)
     mesh = mesh.connectivity(extraction_mode="largest")
+    surf = mesh.extract_surface().triangulate()
+    surf = surf.compute_normals(cell_normals=True, point_normals=False)
+    surf = surf.compute_cell_sizes()
 
-    vertices_np = mesh.points.astype(np.float32)
+    vertices_np = surf.points.astype(np.float32)
     center = vertices_np.mean(axis=0)
     vertices_np -= center
     scale = np.max(np.abs(vertices_np))
     vertices_np /= scale + 1e-8
     vertices = torch.tensor(vertices_np, dtype=torch.float32)
 
-    faces = torch.tensor(mesh.faces.reshape(-1, 4)[:, 1:], dtype=torch.long)
-    edges = torch.cat(
-        [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]],
-        dim=0,
+    faces = torch.tensor(surf.faces.reshape(-1, 4)[:, 1:], dtype=torch.long)
+    cell_normals = torch.tensor(surf.cell_data["Normals"], dtype=torch.float32)
+    normalized_cell_areas = 0.5 * torch.linalg.norm(
+        torch.cross(
+            vertices[faces[:, 1]] - vertices[faces[:, 0]],
+            vertices[faces[:, 2]] - vertices[faces[:, 0]],
+            dim=1,
+        ),
+        dim=1,
     )
-    edge_index = to_undirected(edges.T)
+
+    mesh_edge_index = _build_mesh_edges(faces)
+    knn_edge_index = _build_knn_edges(vertices, KNN_K)
+    edge_index = _merge_edge_indices(mesh_edge_index, knn_edge_index)
+    edge_attr = _compute_edge_attr(vertices, edge_index)
+
+    vertex_normals = _compute_vertex_normals(vertices.size(0), faces, cell_normals)
+    local_area = _compute_local_area(vertices.size(0), faces, normalized_cell_areas)
+    curvature = _compute_curvature(vertices, mesh_edge_index)
+    edge_length_stats = _compute_edge_length_stats(vertices, mesh_edge_index)
 
     geom_name = input_json["geom_name"]
     geom_params = torch.tensor(
@@ -323,15 +458,27 @@ def _prepare_mesh(
         dtype=torch.float32,
     ).unsqueeze(0).repeat(vertices.size(0), 1)
 
-    x_fp32 = torch.cat([vertices, flow_params, geom_params], dim=1)
+    x_fp32 = torch.cat(
+        [
+            vertices,
+            flow_params,
+            geom_params,
+            curvature,
+            vertex_normals,
+            local_area,
+            edge_length_stats,
+        ],
+        dim=1,
+    )
     cp_true = None
-    if "cp" in mesh.point_data:
-        cp_true = torch.tensor(mesh.point_data["cp"], dtype=torch.float32)
+    if "cp" in surf.point_data:
+        cp_true = torch.tensor(surf.point_data["cp"], dtype=torch.float32)
 
     return PreparedMesh(
-        mesh=mesh,
+        mesh=surf,
         vertices=vertices,
         edge_index=edge_index,
+        edge_attr=edge_attr,
         x_fp32=x_fp32,
         cp_true=cp_true,
     )

@@ -103,7 +103,12 @@ class GraphDataset(torch.utils.data.Dataset):
 
         data = Data(
             x=raw["x"],
+            xyz=raw.get("xyz", raw["x"][:, :3]),
             edge_index=raw["edge_index"],
+            edge_attr=raw.get(
+                "edge_attr",
+                torch.zeros((raw["edge_index"].size(1), EDGE_DIM), dtype=torch.float16),
+            ),
             pos=raw["pos"],
             y_cp=raw["y_cp"].float(),
         )
@@ -114,6 +119,7 @@ class GraphDataset(torch.utils.data.Dataset):
 
         data.CL_true = torch.tensor(raw["meta"]["CL"], dtype=torch.float32)
         data.CD_true = torch.tensor(raw["meta"]["CD"], dtype=torch.float32)
+        data.alpha_deg = torch.tensor(raw["meta"].get("alpha_deg", 0.0), dtype=torch.float32)
 
         return data
 
@@ -125,6 +131,37 @@ class GraphDataset(torch.utils.data.Dataset):
 def smoothness_loss(pred, edge_index):
     src, dst = edge_index
     return F.mse_loss(pred[src], pred[dst])
+
+
+def gradient_loss(pred, target, edge_index):
+    src, dst = edge_index
+    pred_grad = pred[src] - pred[dst]
+    target_grad = target[src] - target[dst]
+    return F.smooth_l1_loss(pred_grad, target_grad, beta=1.0)
+
+
+def composite_loss(pred, data, criterion):
+    L_field = criterion(pred, data.y_cp)
+    L_gradient = gradient_loss(pred.float(), data.y_cp.float(), data.edge_index)
+    L_smoothness = smoothness_loss(pred.float(), data.edge_index)
+
+    cp_pred_fp32 = pred.float()
+    CL_pred, CD_pred = compute_force_coefficients(cp_pred_fp32, data)
+    CL_true = data.CL_true.to(cp_pred_fp32.device)
+    CD_true = data.CD_true.to(cp_pred_fp32.device)
+
+    L_CL = ((CL_pred - CL_true) ** 2).mean()
+    L_CD = ((CD_pred - CD_true) ** 2).mean()
+
+    loss = (
+        LAMBDA_FIELD * L_field
+        + LAMBDA_GRADIENT * L_gradient
+        + LAMBDA_CL * L_CL
+        + LAMBDA_CD * L_CD
+        + LAMBDA_SMOOTHNESS * L_smoothness
+    )
+
+    return loss
 
 
 
@@ -156,15 +193,7 @@ def compute_force_coefficients(cp_pred, data):
         Fx_total.index_add_(0, cell_graph_ids, Fx)
         Fy_total.index_add_(0, cell_graph_ids, Fy)
 
-        alpha_deg = []
-        for graph_idx in range(num_graphs):
-            graph_nodes = data.x[data.batch == graph_idx]
-            if graph_nodes.numel() > 0:
-                alpha_deg.append(graph_nodes[0, 5])
-            else:
-                alpha_deg.append(torch.tensor(0.0, device=cp_pred.device))
-
-        alpha_deg = torch.stack(alpha_deg, dim=0).to(cp_pred.device)
+        alpha_deg = data.alpha_deg.to(cp_pred.device)
         alpha = torch.deg2rad(alpha_deg)
 
         CD = Fx_total * torch.cos(alpha) + Fy_total * torch.sin(alpha)
@@ -174,13 +203,48 @@ def compute_force_coefficients(cp_pred, data):
     Fx_total = Fx.sum()
     Fy_total = Fy.sum()
 
-    alpha_deg = data.x[0, 5]
+    alpha_deg = data.alpha_deg.to(cp_pred.device)
     alpha = torch.deg2rad(alpha_deg)
 
     CD = Fx_total * torch.cos(alpha) + Fy_total * torch.sin(alpha)
     CL = -Fx_total * torch.sin(alpha) + Fy_total * torch.cos(alpha)
 
     return CL, CD
+
+
+def compute_validation_metrics(pred, data):
+    pred_fp32 = pred.float()
+    target = data.y_cp.float()
+
+    diff = pred_fp32.squeeze(-1) - target.squeeze(-1)
+    rmse = torch.sqrt(torch.mean(diff ** 2)).item()
+    mae = torch.mean(torch.abs(diff)).item()
+    rel_l2 = (torch.norm(diff) / (torch.norm(target.squeeze(-1)) + 1e-8)).item()
+
+    pred_flat = pred_fp32.squeeze(-1).reshape(-1)
+    target_flat = target.squeeze(-1).reshape(-1)
+    pred_mean = pred_flat.mean()
+    target_mean = target_flat.mean()
+    pred_centered = pred_flat - pred_mean
+    target_centered = target_flat - target_mean
+    denom = torch.sqrt(torch.sum(pred_centered ** 2) * torch.sum(target_centered ** 2))
+    corr = (torch.sum(pred_centered * target_centered) / (denom + 1e-12)).item() if denom.item() != 0 else 0.0
+
+    CL_pred, CD_pred = compute_force_coefficients(pred_fp32, data)
+    CL_true = data.CL_true.to(pred_fp32.device)
+    CD_true = data.CD_true.to(pred_fp32.device)
+
+    cl_error = torch.mean(torch.abs(CL_pred - CL_true)).item()
+    cd_error = torch.mean(torch.abs(CD_pred - CD_true)).item()
+
+    return {
+        "corr": corr,
+        "rmse": rmse,
+        "mae": mae,
+        "rel_l2": rel_l2,
+        "cl_error": cl_error,
+        "cd_error": cd_error,
+    }
 
 ############################################################
 # TRAIN
@@ -247,7 +311,13 @@ def main():
         out_dim=OUT_DIM,
         num_gnn_layers=NUM_GNN_LAYERS,
         grid_size=GRID_SIZE,
-        dropout=0.2,
+        edge_dim=EDGE_DIM,
+        dropout=DROPOUT,
+        fourier_bands=FOURIER_BANDS,
+        attention_heads=ATTENTION_HEADS,
+        attention_query_chunk_size=ATTENTION_QUERY_CHUNK_SIZE,
+        attention_max_nodes=ATTENTION_MAX_NODES,
+        attention_local_radius=ATTENTION_LOCAL_RADIUS,
     ).to(DEVICE)
     model = torch.compile(model)
 
@@ -285,41 +355,7 @@ def main():
 
             with autocast("cuda", dtype=torch.float16):
                 pred = model(data)
-                # --------------------------
-                # FIELD LOSS
-                # --------------------------
-                L_field = criterion(pred, data.y_cp)
-
-                # --------------------------
-                # FORCE LOSS (FULL PRECISION)
-                # --------------------------
-                cp_pred_fp32 = pred.float()
-                cp_true_fp32 = data.y_cp.float()
-
-                CL_pred, CD_pred = compute_force_coefficients(cp_pred_fp32, data)
-                CL_true = data.CL_true.to(DEVICE)
-                CD_true = data.CD_true.to(DEVICE)
-
-                L_CL = ((CL_pred - CL_true) ** 2).mean()
-                L_CD = ((CD_pred - CD_true) ** 2).mean()
-
-                # --------------------------
-                # TOTAL LOSS
-                # --------------------------
-                LAMBDA_FIELD = 1.0
-                LAMBDA_CL = 0.1
-                LAMBDA_CD = 0.1
-
-                loss = (
-                    LAMBDA_FIELD * L_field
-                    + LAMBDA_CL * L_CL 
-                    + LAMBDA_CD * L_CD
-                )
-
-                if USE_SMOOTHNESS_LOSS:
-                    loss = loss + SMOOTHNESS_WEIGHT * smoothness_loss(
-                        pred, data.edge_index
-                    )
+                loss = composite_loss(pred, data, criterion)
 
             if not torch.isfinite(loss):
                 print("Skipped batch (NaN/Inf)")
@@ -338,10 +374,19 @@ def main():
         ############################################################
 
         val_loss=None
+        val_metrics=None
 
         if epoch % VALIDATE_EVERY == 0 or epoch == EPOCHS:
             model.eval()
             val_loss = 0.0
+            val_metrics = {
+                "corr": 0.0,
+                "rmse": 0.0,
+                "mae": 0.0,
+                "rel_l2": 0.0,
+                "cl_error": 0.0,
+                "cd_error": 0.0,
+            }
 
             with torch.no_grad():
                 for data in val_loader:
@@ -350,41 +395,17 @@ def main():
 
                     with autocast("cuda", dtype=torch.float16):
                         pred = model(data)
-                        # loss = criterion(pred, data.y_cp)
-                        # --------------------------
-                        # FIELD LOSS
-                        # --------------------------
-                        L_field = criterion(pred, data.y_cp)
-
-                        # --------------------------
-                        # FORCE LOSS (FULL PRECISION)
-                        # --------------------------
-                        cp_pred_fp32 = pred.float()
-                        cp_true_fp32 = data.y_cp.float()
-
-                        CL_pred, CD_pred = compute_force_coefficients(cp_pred_fp32, data)
-                        CL_true = data.CL_true.to(DEVICE)
-                        CD_true = data.CD_true.to(DEVICE)
-
-                        L_CL = ((CL_pred - CL_true) ** 2).mean()
-                        L_CD = ((CD_pred - CD_true) ** 2).mean()
-
-                        # --------------------------
-                        # TOTAL LOSS
-                        # --------------------------
-                        LAMBDA_FIELD = 1.0
-                        LAMBDA_CL = 0.1
-                        LAMBDA_CD = 0.1
-
-                        loss = (
-                            LAMBDA_FIELD * L_field
-                            + LAMBDA_CL * L_CL
-                            + LAMBDA_CD * L_CD
-                        )
+                        loss = composite_loss(pred, data, criterion)
 
                     val_loss += loss.item()
 
+                    batch_metrics = compute_validation_metrics(pred, data)
+                    for key in val_metrics:
+                        val_metrics[key] += batch_metrics[key]
+
             val_loss /= len(val_loader)
+            for key in val_metrics:
+                val_metrics[key] /= len(val_loader)
 
             scheduler.step()
 
@@ -396,6 +417,12 @@ def main():
         writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
         if val_loss is not None:
             writer.add_scalar("val/loss", val_loss, epoch)
+            writer.add_scalar("val/corr", val_metrics["corr"], epoch)
+            writer.add_scalar("val/rmse", val_metrics["rmse"], epoch)
+            writer.add_scalar("val/mae", val_metrics["mae"], epoch)
+            writer.add_scalar("val/rel_l2", val_metrics["rel_l2"], epoch)
+            writer.add_scalar("val/cl_error", val_metrics["cl_error"], epoch)
+            writer.add_scalar("val/cd_error", val_metrics["cd_error"], epoch)
 
 
         elapsed = time.time() - start
@@ -405,6 +432,12 @@ def main():
                 f"Epoch {epoch:03d} | "
                 f"Train Loss: {train_loss:.6e} | "
                 f"Val Loss: {val_loss:.6e} | "
+                f"Corr: {val_metrics['corr']:.6f} | "
+                f"RMSE: {val_metrics['rmse']:.6e} | "
+                f"MAE: {val_metrics['mae']:.6e} | "
+                f"Rel L2: {val_metrics['rel_l2']:.6e} | "
+                f"CL Error: {val_metrics['cl_error']:.6e} | "
+                f"CD Error: {val_metrics['cd_error']:.6e} | "
                 f"Time: {elapsed:.2f}s"
             )
         else:
@@ -426,7 +459,7 @@ def main():
             )
             print("✓ Saved BEST model")
 
-        if epoch % 50 == 0:
+        if epoch % 10 == 0:
             torch.save(
                 model.state_dict(),
                 os.path.join(PT_OUT_DIR, f"model_epoch_{epoch}.pt"),

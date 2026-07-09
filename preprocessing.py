@@ -6,6 +6,7 @@ import configparser
 import pandas as pd
 import numpy as np
 
+import torch.nn.functional as F
 from torch_geometric.utils import to_undirected
 from config import *
 
@@ -70,6 +71,103 @@ class RunningStats:
 
 def normalize(x, mean, std):
     return (x - mean) / std
+
+
+def build_mesh_edges(faces):
+    edges = torch.cat(
+        [
+            faces[:, [0, 1]],
+            faces[:, [1, 2]],
+            faces[:, [2, 0]],
+        ],
+        dim=0,
+    )
+    return to_undirected(edges.T)
+
+
+def build_knn_edges(vertices, k):
+    num_nodes = vertices.size(0)
+    if num_nodes <= 1 or k <= 0:
+        return torch.empty((2, 0), dtype=torch.long)
+
+    k = min(k, num_nodes - 1)
+    edge_chunks = []
+    chunk_size = 4096
+
+    for start in range(0, num_nodes, chunk_size):
+        end = min(start + chunk_size, num_nodes)
+        dist = torch.cdist(vertices[start:end], vertices)
+        local = torch.arange(end - start)
+        dist[local, torch.arange(start, end)] = float("inf")
+        nn_idx = dist.topk(k, largest=False).indices
+        src = torch.arange(start, end).unsqueeze(1).expand(-1, k)
+        edge_chunks.append(torch.stack([src.reshape(-1), nn_idx.reshape(-1)], dim=0))
+
+    return to_undirected(torch.cat(edge_chunks, dim=1))
+
+
+def merge_edge_indices(*edge_indices):
+    edge_index = torch.cat([edge for edge in edge_indices if edge.numel() > 0], dim=1)
+    edge_index = torch.unique(edge_index.T, dim=0).T.contiguous()
+    return edge_index
+
+
+def compute_edge_attr(vertices, edge_index):
+    src, dst = edge_index
+    rel_xyz = vertices[dst] - vertices[src]
+    distance = torch.linalg.norm(rel_xyz, dim=1, keepdim=True)
+    direction = rel_xyz / (distance + 1e-8)
+    edge_length = distance
+    return torch.cat([edge_length, rel_xyz, distance, direction], dim=1)
+
+
+def compute_vertex_normals(num_nodes, faces, cell_normals):
+    vertex_normals = torch.zeros((num_nodes, 3), dtype=torch.float32)
+    repeated_normals = cell_normals.repeat_interleave(3, dim=0)
+    vertex_normals.index_add_(0, faces.reshape(-1), repeated_normals)
+    return F.normalize(vertex_normals, p=2, dim=1, eps=1e-8)
+
+
+def compute_local_area(num_nodes, faces, cell_areas):
+    local_area = torch.zeros((num_nodes, 1), dtype=torch.float32)
+    area_share = (cell_areas / 3.0).repeat_interleave(3).unsqueeze(1)
+    local_area.index_add_(0, faces.reshape(-1), area_share)
+    return local_area
+
+
+def compute_curvature(vertices, mesh_edge_index):
+    src, dst = mesh_edge_index
+    neighbor_sum = torch.zeros_like(vertices)
+    neighbor_count = torch.zeros((vertices.size(0), 1), dtype=vertices.dtype)
+    neighbor_sum.index_add_(0, src, vertices[dst])
+    neighbor_count.index_add_(0, src, torch.ones_like(neighbor_count[src]))
+    neighbor_mean = neighbor_sum / (neighbor_count + 1e-8)
+    return torch.linalg.norm(vertices - neighbor_mean, dim=1, keepdim=True)
+
+
+def compute_edge_length_stats(vertices, mesh_edge_index):
+    src, dst = mesh_edge_index
+    lengths = torch.linalg.norm(vertices[dst] - vertices[src], dim=1)
+    num_nodes = vertices.size(0)
+
+    mean = torch.zeros(num_nodes, dtype=vertices.dtype)
+    count = torch.zeros(num_nodes, dtype=vertices.dtype)
+    min_len = torch.full((num_nodes,), float("inf"), dtype=vertices.dtype)
+    max_len = torch.zeros(num_nodes, dtype=vertices.dtype)
+
+    mean.index_add_(0, src, lengths)
+    count.index_add_(0, src, torch.ones_like(lengths))
+    min_len.scatter_reduce_(0, src, lengths, reduce="amin", include_self=True)
+    max_len.scatter_reduce_(0, src, lengths, reduce="amax", include_self=True)
+
+    mean = mean / (count + 1e-8)
+    sq_diff = (lengths - mean[src]) ** 2
+    var = torch.zeros(num_nodes, dtype=vertices.dtype)
+    var.index_add_(0, src, sq_diff)
+    std = torch.sqrt(var / (count + 1e-8) + 1e-12)
+
+    min_len = torch.where(torch.isfinite(min_len), min_len, torch.zeros_like(min_len))
+    return torch.stack([mean, min_len, max_len, std], dim=1)
 
 
 ############################################
@@ -251,20 +349,13 @@ def build_case_tensors(row, geom_config):
     )
 
     ########################################################
-    # EDGES (FOR GNN)
+    # EDGES + EDGE FEATURES (MESH EDGES + KNN)
     ########################################################
 
-    edges = torch.cat(
-        [
-            faces[:, [0, 1]],
-            faces[:, [1, 2]],
-            faces[:, [2, 0]],
-        ],
-        dim=0,
-    )
-
-    edge_index = to_undirected(edges.T)
-    del edges  # Free intermediate
+    mesh_edge_index = build_mesh_edges(faces)
+    knn_edge_index = build_knn_edges(vertices, KNN_K)
+    edge_index = merge_edge_indices(mesh_edge_index, knn_edge_index)
+    edge_attr = compute_edge_attr(vertices, edge_index)
 
     ########################################################
     # GEOMETRY PARAMETERS
@@ -292,11 +383,36 @@ def build_case_tensors(row, geom_config):
     flow_params = flow_params.unsqueeze(0).repeat(vertices.size(0), 1)
 
     ########################################################
+    # GEOMETRY NODE FEATURES
+    ########################################################
+
+    normalized_cell_areas = 0.5 * torch.linalg.norm(
+        torch.cross(
+            vertices[faces[:, 1]] - vertices[faces[:, 0]],
+            vertices[faces[:, 2]] - vertices[faces[:, 0]],
+            dim=1,
+        ),
+        dim=1,
+    )
+    vertex_normals = compute_vertex_normals(vertices.size(0), faces, cell_normals)
+    local_area = compute_local_area(vertices.size(0), faces, normalized_cell_areas)
+    curvature = compute_curvature(vertices, mesh_edge_index)
+    edge_length_stats = compute_edge_length_stats(vertices, mesh_edge_index)
+
+    ########################################################
     # NODE FEATURES
     ########################################################
 
     x_fp32 = torch.cat(
-        [vertices, flow_params, geom_params],
+        [
+            vertices,
+            flow_params,
+            geom_params,
+            curvature,
+            vertex_normals,
+            local_area,
+            edge_length_stats,
+        ],
         dim=1,
     )
     del geom_params, flow_params  # Free components
@@ -320,14 +436,16 @@ def build_case_tensors(row, geom_config):
         "x_fp32": x_fp32,
         "coords_2d": vertices[:, :2],
         "edge_index": edge_index,
+        "edge_attr": edge_attr,
         "faces": faces,
         "cell_normals": cell_normals,
         "cell_areas": cell_areas,
         "y_cp_fp32": y_cp_fp32,
         "meta": {
-            "CL": row[7],
-            "CD": row[8],
+            "CL": row[8],
+            "CD": row[7],
             "CM": row[9],
+            "alpha_deg": row[5],
         },
     }
 
@@ -350,7 +468,9 @@ def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
     # Build data dictionary
     data = {
         "x": x_norm,
+        "xyz": case_pack["x_fp32"][:, :3].half(),
         "edge_index": case_pack["edge_index"],
+        "edge_attr": case_pack["edge_attr"].half(),
         "pos": case_pack["coords_2d"].half(),
         "faces": case_pack["faces"],
         "cell_normals": case_pack["cell_normals"],
@@ -364,6 +484,7 @@ def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
             "CL": case_pack["meta"]["CL"],
             "CD": case_pack["meta"]["CD"],
             "CM": case_pack["meta"]["CM"],
+            "alpha_deg": case_pack["meta"]["alpha_deg"],
         },
     }
 
