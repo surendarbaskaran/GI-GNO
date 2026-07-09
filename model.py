@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,6 +95,54 @@ class GraphEncoder(nn.Module):
 # 2. LEARNED ATTENTION: GRAPH -> GRID
 ############################################
 
+class ManualMultiheadAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads=4, dropout=0.0):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.dropout = nn.Dropout(dropout)
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def _reshape_heads(self, x):
+        batch_size, seq_len, _ = x.shape
+        x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        return x.transpose(1, 2).contiguous()
+
+    def forward(self, query, key, value, need_weights=False):
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        q = self._reshape_heads(q)
+        k = self._reshape_heads(k)
+        v = self._reshape_heads(v)
+
+        q_fp32 = q.float()
+        k_fp32 = k.float()
+        v_fp32 = v.float()
+
+        scores = torch.matmul(q_fp32, k_fp32.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = torch.softmax(scores, dim=-1)
+        if self.training:
+            attn = self.dropout(attn)
+
+        attn_out = torch.matmul(attn, v_fp32)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(query.size(0), query.size(1), self.hidden_dim)
+        attn_out = self.out_proj(attn_out.to(dtype=query.dtype))
+
+        if need_weights:
+            return attn_out, attn.detach().mean(dim=1)
+        return attn_out, None
+
+
 class CoordinateEmbedding(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -128,8 +177,8 @@ class LatentGridMapper(nn.Module):
         self.grid_pos = CoordinateEmbedding(hidden_dim)
         self.node_proj = nn.Linear(hidden_dim, hidden_dim)
         self.grid_query_bias = nn.Parameter(torch.randn(hidden_dim) * 0.02)
-        self.attn = nn.MultiheadAttention(
-            hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        self.attn = ManualMultiheadAttention(
+            hidden_dim, num_heads=num_heads, dropout=dropout
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
@@ -302,8 +351,8 @@ class GraphDecoder(nn.Module):
         self.grid_pos = CoordinateEmbedding(hidden_dim)
         self.sample_proj = nn.Linear(hidden_dim, hidden_dim)
         self.query_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        self.cross_attn = ManualMultiheadAttention(
+            hidden_dim, num_heads=num_heads, dropout=dropout
         )
         self.edge_dim = edge_dim
         self.refine = GraphRefineLayer(hidden_dim, edge_dim, dropout)
