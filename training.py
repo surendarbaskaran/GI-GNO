@@ -20,6 +20,92 @@ os.makedirs(f"{PT_OUT_DIR}/bestmodel", exist_ok=True)
 os.makedirs(TENSORBOARD, exist_ok=True)
 
 
+def tensor_stats(name, tensor):
+    tensor = tensor.detach().float().reshape(-1)
+    if tensor.numel() == 0:
+        return f"{name}: empty"
+    std = tensor.std(unbiased=False) if tensor.numel() > 1 else torch.tensor(0.0)
+    return (
+        f"{name}: min={tensor.min().item():.6e}, "
+        f"max={tensor.max().item():.6e}, "
+        f"mean={tensor.mean().item():.6e}, "
+        f"std={std.item():.6e}"
+    )
+
+
+def log_training_sample_contract(dataset):
+    raw_path, raw_item_idx = dataset.samples[0]
+    raw = dataset._load_sample(raw_path, raw_item_idx)
+    case_name = raw.get("meta", {}).get("case_name", "unknown")
+    sample = dataset[0]
+    print("==== TRAINING PT PREPROCESSING CHECK ====")
+    print(f"PT case_name: {case_name}")
+    print(f"PT x shape: {tuple(sample.x.shape)}")
+    print(f"PT xyz shape: {tuple(sample.xyz.shape)}")
+    print(f"PT pos shape: {tuple(sample.pos.shape)}")
+    print(f"PT edge_index shape: {tuple(sample.edge_index.shape)}")
+    print(f"PT edge_attr shape: {tuple(sample.edge_attr.shape)}")
+    print(f"PT first 3 normalized vertices: {sample.xyz[:3].float().tolist()}")
+    print(f"PT feature order: xyz | flow | geom | curvature | normal | local_area | edge_stats")
+    print(tensor_stats("PT x_norm", sample.x))
+    print(tensor_stats("PT edge_attr", sample.edge_attr))
+
+    assert sample.x.size(1) == NODE_IN_DIM, (
+        f"PT feature width mismatch: got {sample.x.size(1)}, expected {NODE_IN_DIM}"
+    )
+    assert sample.edge_attr.size(1) == EDGE_DIM, (
+        f"PT edge_attr width mismatch: got {sample.edge_attr.size(1)}, expected {EDGE_DIM}"
+    )
+    assert torch.allclose(sample.pos.float(), sample.xyz[:, :2].float(), atol=1e-3), (
+        "PT pos must equal PT xyz[:, :2]."
+    )
+    assert torch.isfinite(sample.x.float()).all(), "PT x contains non-finite values."
+    assert torch.isfinite(sample.edge_attr.float()).all(), "PT edge_attr contains non-finite values."
+    print("==== END TRAINING PT PREPROCESSING CHECK ====")
+
+
+def make_loader(dataset, shuffle):
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=4 if NUM_WORKERS > 0 else None,
+        collate_fn=custom_collate_fn,
+    )
+
+
+def build_validation_folds(dataset_size):
+    if ROTATE_VALIDATION_FOLDS:
+        num_folds = max(2, min(VALIDATION_FOLDS, dataset_size))
+    else:
+        val_size = max(1, int(dataset_size * VAL_SPLIT))
+        num_folds = max(2, min(round(dataset_size / val_size), dataset_size))
+
+    generator = torch.Generator().manual_seed(42)
+    perm = torch.randperm(dataset_size, generator=generator).tolist()
+    folds = [perm[i::num_folds] for i in range(num_folds)]
+    folds = [fold for fold in folds if fold]
+    return folds
+
+
+def build_fold_datasets(dataset, folds, fold_idx):
+    val_indices = folds[fold_idx]
+    val_set = set(val_indices)
+    train_indices = [
+        idx
+        for fold in folds
+        for idx in fold
+        if idx not in val_set
+    ]
+    return (
+        torch.utils.data.Subset(dataset, train_indices),
+        torch.utils.data.Subset(dataset, val_indices),
+    )
+
+
 ############################################################
 # DATASET
 ############################################################
@@ -212,7 +298,18 @@ def compute_force_coefficients(cp_pred, data):
     return CL, CD
 
 
-def compute_validation_metrics(pred, data):
+def manual_centered_corr(pred, target):
+    pred_flat = pred.detach().float().reshape(-1)
+    target_flat = target.detach().float().reshape(-1)
+    pred_centered = pred_flat - pred_flat.mean()
+    target_centered = target_flat - target_flat.mean()
+    denom = torch.sqrt(torch.sum(pred_centered ** 2) * torch.sum(target_centered ** 2))
+    if denom.item() == 0:
+        return 0.0
+    return (torch.sum(pred_centered * target_centered) / (denom + 1e-12)).item()
+
+
+def compute_validation_metrics(pred, data, cp_mean=None, cp_std=None):
     pred_fp32 = pred.float()
     target = data.y_cp.float()
 
@@ -221,14 +318,15 @@ def compute_validation_metrics(pred, data):
     mae = torch.mean(torch.abs(diff)).item()
     rel_l2 = (torch.norm(diff) / (torch.norm(target.squeeze(-1)) + 1e-8)).item()
 
-    pred_flat = pred_fp32.squeeze(-1).reshape(-1)
-    target_flat = target.squeeze(-1).reshape(-1)
-    pred_mean = pred_flat.mean()
-    target_mean = target_flat.mean()
-    pred_centered = pred_flat - pred_mean
-    target_centered = target_flat - target_mean
-    denom = torch.sqrt(torch.sum(pred_centered ** 2) * torch.sum(target_centered ** 2))
-    corr = (torch.sum(pred_centered * target_centered) / (denom + 1e-12)).item() if denom.item() != 0 else 0.0
+    corr_before_denorm = manual_centered_corr(pred_fp32, target)
+    corr_after_denorm = corr_before_denorm
+    if cp_mean is not None and cp_std is not None:
+        cp_mean = cp_mean.to(pred_fp32.device, dtype=pred_fp32.dtype)
+        cp_std = cp_std.to(pred_fp32.device, dtype=pred_fp32.dtype)
+        corr_after_denorm = manual_centered_corr(
+            pred_fp32 * cp_std + cp_mean,
+            target * cp_std + cp_mean,
+        )
 
     CL_pred, CD_pred = compute_force_coefficients(pred_fp32, data)
     CL_true = data.CL_true.to(pred_fp32.device)
@@ -238,7 +336,9 @@ def compute_validation_metrics(pred, data):
     cd_error = torch.mean(torch.abs(CD_pred - CD_true)).item()
 
     return {
-        "corr": corr,
+        "corr": corr_after_denorm,
+        "corr_before_denorm": corr_before_denorm,
+        "corr_after_denorm": corr_after_denorm,
         "rmse": rmse,
         "mae": mae,
         "rel_l2": rel_l2,
@@ -267,38 +367,18 @@ def main():
         raise RuntimeError(
             f"No training samples found in {DATA_DIR}. Run preprocessing first to create chunk files."
         )
+    if len(dataset) < 2:
+        raise RuntimeError("At least two samples are required for rotating validation.")
+    log_training_sample_contract(dataset)
 
-    # ---- Train/Val split ----
-    val_split = 0.2
-    val_size = max(1, int(len(dataset) * val_split))
-    train_size = len(dataset) - val_size
+    norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu")
+    cp_mean = norm_stats["cp_mean"].float()
+    cp_std = norm_stats["cp_std"].float()
 
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-        collate_fn=custom_collate_fn,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-        collate_fn=custom_collate_fn,
+    folds = build_validation_folds(len(dataset))
+    print(
+        f"Validation strategy: {'rotating' if ROTATE_VALIDATION_FOLDS else 'fixed'} "
+        f"{len(folds)} folds | fold sizes: {[len(fold) for fold in folds]}"
     )
 
     ############################################################
@@ -326,7 +406,8 @@ def main():
         lr=LR,
         weight_decay=WEIGHT_DECAY,
     )
-
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE == "cuda"))
+    
     # Cosine LR scheduler (very good for operator learning)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -345,6 +426,9 @@ def main():
     for epoch in range(1, EPOCHS + 1):
 
         start = time.time()
+        active_fold = (epoch - 1) % len(folds) if ROTATE_VALIDATION_FOLDS else 0
+        train_dataset, val_dataset = build_fold_datasets(dataset, folds, active_fold)
+        train_loader = make_loader(train_dataset, shuffle=True)
         model.train()
         train_loss = 0.0
 
@@ -361,9 +445,25 @@ def main():
                 print("Skipped batch (NaN/Inf)")
                 continue
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            bad_grad = False
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    bad_grad = True
+                    break
+
+            if bad_grad:
+                print("NaN gradients detected")
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()          # VERY IMPORTANT
+                continue
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
 
@@ -381,12 +481,19 @@ def main():
             val_loss = 0.0
             val_metrics = {
                 "corr": 0.0,
+                "corr_before_denorm": 0.0,
+                "corr_after_denorm": 0.0,
                 "rmse": 0.0,
                 "mae": 0.0,
                 "rel_l2": 0.0,
                 "cl_error": 0.0,
                 "cd_error": 0.0,
             }
+            val_loader = make_loader(val_dataset, shuffle=False)
+            print(
+                f"Validation fold {active_fold + 1}/{len(folds)} | "
+                f"train cases: {len(train_dataset)} | val cases: {len(val_dataset)}"
+            )
 
             with torch.no_grad():
                 for data in val_loader:
@@ -399,7 +506,7 @@ def main():
 
                     val_loss += loss.item()
 
-                    batch_metrics = compute_validation_metrics(pred, data)
+                    batch_metrics = compute_validation_metrics(pred, data, cp_mean, cp_std)
                     for key in val_metrics:
                         val_metrics[key] += batch_metrics[key]
 
@@ -418,6 +525,8 @@ def main():
         if val_loss is not None:
             writer.add_scalar("val/loss", val_loss, epoch)
             writer.add_scalar("val/corr", val_metrics["corr"], epoch)
+            writer.add_scalar("val/corr_before_denorm", val_metrics["corr_before_denorm"], epoch)
+            writer.add_scalar("val/corr_after_denorm", val_metrics["corr_after_denorm"], epoch)
             writer.add_scalar("val/rmse", val_metrics["rmse"], epoch)
             writer.add_scalar("val/mae", val_metrics["mae"], epoch)
             writer.add_scalar("val/rel_l2", val_metrics["rel_l2"], epoch)
@@ -433,6 +542,8 @@ def main():
                 f"Train Loss: {train_loss:.6e} | "
                 f"Val Loss: {val_loss:.6e} | "
                 f"Corr: {val_metrics['corr']:.6f} | "
+                f"Corr Before Denorm: {val_metrics['corr_before_denorm']:.6f} | "
+                f"Corr After Denorm: {val_metrics['corr_after_denorm']:.6f} | "
                 f"RMSE: {val_metrics['rmse']:.6e} | "
                 f"MAE: {val_metrics['mae']:.6e} | "
                 f"Rel L2: {val_metrics['rel_l2']:.6e} | "

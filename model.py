@@ -130,6 +130,7 @@ class ManualMultiheadAttention(nn.Module):
         v_fp32 = v.float()
 
         scores = torch.matmul(q_fp32, k_fp32.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = scores - scores.max(dim=-1, keepdim=True).values
         attn = torch.softmax(scores, dim=-1)
         if self.training:
             attn = self.dropout(attn)

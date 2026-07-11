@@ -42,6 +42,15 @@ from model import GAGNO
 OUTPUT_DIR = "/tmp/output"
 FLOW_KEYS = ("alt_kft", "Re", "M_inf", "alpha_deg", "beta_deg")
 GEOM_KEYS = ("B1", "B2", "B3", "C1", "C2", "C3", "C4", "S1", "S2", "S3")
+FEATURE_LAYOUT = (
+    "xyz[0:3]",
+    "flow[3:8]",
+    "geom[8:18]",
+    "curvature[18:19]",
+    "normal[19:22]",
+    "local_area[22:23]",
+    "edge_stats[23:27]",
+)
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
@@ -73,6 +82,8 @@ class PreparedMesh:
     edge_attr: torch.Tensor
     x_fp32: torch.Tensor
     cp_true: torch.Tensor | None
+    center: np.ndarray
+    scale: float
 
 
 _STATE: InferenceState | None = None
@@ -105,7 +116,10 @@ def load_model() -> InferenceState:
     ).to(device)
 
     checkpoint = torch.load(CHECKPOINT, map_location=device)
-    state_dict = _extract_state_dict(checkpoint)
+    state_dict = {
+                    k.replace("_orig_mod.", ""): v
+                    for k, v in checkpoint.items()
+                }
     incompatible = model.load_state_dict(state_dict, strict=False)
     if incompatible.missing_keys:
         LOGGER.warning(
@@ -145,7 +159,20 @@ def run_inference(vtk_path: str, input_json: dict[str, Any]) -> dict[str, Any]:
         inputs = _validate_request(vtk_path, input_json, state.geom_config)
         prepared = _prepare_mesh(vtk_path, inputs, state.geom_config)
 
+        _log_vector("x_mean", state.x_mean)
+        _log_vector("x_std", state.x_std)
+        _log_vector("cp_mean", state.cp_mean)
+        _log_vector("cp_std", state.cp_std)
+        assert state.x_mean.numel() == NODE_IN_DIM, (
+            f"x_mean width {state.x_mean.numel()} does not match NODE_IN_DIM={NODE_IN_DIM}."
+        )
+        assert state.x_std.numel() == NODE_IN_DIM, (
+            f"x_std width {state.x_std.numel()} does not match NODE_IN_DIM={NODE_IN_DIM}."
+        )
+
         x = normalize(prepared.x_fp32, state.x_mean, state.x_std)
+        assert torch.isfinite(x).all(), "Non-finite values found after inference feature normalization."
+        LOGGER.info("%s", _tensor_stats("Inference x_norm", x))
         data = Data(
             x=x,
             xyz=prepared.vertices,
@@ -153,12 +180,32 @@ def run_inference(vtk_path: str, input_json: dict[str, Any]) -> dict[str, Any]:
             edge_attr=prepared.edge_attr,
             pos=prepared.vertices[:, :2],
         ).to(state.device)
+        assert torch.allclose(data.pos.cpu(), data.xyz[:, :2].cpu(), atol=1e-6), (
+            "Inference Data.pos must equal Data.xyz[:, :2]."
+        )
 
         with torch.no_grad():
             cp_pred_norm = state.model(data).cpu().squeeze()
             cp_pred = cp_pred_norm * state.cp_std + state.cp_mean
 
-        metrics = _compute_metrics(cp_pred, prepared.cp_true)
+        LOGGER.info("%s", _tensor_stats("pred_norm", cp_pred_norm))
+        LOGGER.info("%s", _tensor_stats("pred", cp_pred))
+        if prepared.cp_true is not None:
+            cp_true_norm = normalize(prepared.cp_true, state.cp_mean, state.cp_std)
+            corr_before_denorm = _manual_centered_corr(cp_pred_norm, cp_true_norm)
+            corr_after_denorm = _manual_centered_corr(cp_pred, prepared.cp_true)
+            LOGGER.info("corr_before_denorm=%.6f", corr_before_denorm)
+            LOGGER.info("corr_after_denorm=%.6f", corr_after_denorm)
+            LOGGER.info("%s", _tensor_stats("GT", prepared.cp_true))
+            LOGGER.info("%s", _tensor_stats("Prediction", cp_pred))
+
+        metrics = _compute_metrics(
+            cp_pred,
+            prepared.cp_true,
+            cp_pred_norm=cp_pred_norm,
+            cp_mean=state.cp_mean,
+            cp_std=state.cp_std,
+        )
         cl_pred, cd_pred = compute_force_coefficients(
             prepared.mesh,
             cp_pred,
@@ -230,10 +277,10 @@ def compute_force_coefficients(
     cp_cell = cp_point[faces].mean(axis=1)
 
     fx_total = (-cp_cell * normals[:, 0] * areas).sum()
-    fy_total = (-cp_cell * normals[:, 1] * areas).sum()
+    fz_total = (-cp_cell * normals[:, 2] * areas).sum()
 
-    cd = fx_total * np.cos(alpha) + fy_total * np.sin(alpha)
-    cl = -fx_total * np.sin(alpha) + fy_total * np.cos(alpha)
+    cd = fx_total * np.cos(alpha) + fz_total * np.sin(alpha)
+    cl = -fx_total * np.sin(alpha) + fz_total * np.cos(alpha)
     return float(cl), float(cd)
 
 
@@ -243,10 +290,46 @@ def normalize(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.T
     return (x - mean) / std
 
 
+def _tensor_stats(name: str, tensor: torch.Tensor) -> str:
+    tensor = tensor.detach().float().reshape(-1)
+    if tensor.numel() == 0:
+        return f"{name}: empty"
+    std = tensor.std(unbiased=False) if tensor.numel() > 1 else torch.tensor(0.0)
+    return (
+        f"{name}: min={tensor.min().item():.6e}, "
+        f"max={tensor.max().item():.6e}, "
+        f"mean={tensor.mean().item():.6e}, "
+        f"std={std.item():.6e}"
+    )
+
+
+def _log_vector(name: str, tensor: torch.Tensor, max_items: int = 27) -> None:
+    flat = tensor.detach().float().reshape(-1)
+    values = [f"{v:.6e}" for v in flat[:max_items].tolist()]
+    suffix = " ..." if flat.numel() > max_items else ""
+    LOGGER.info("%s shape=%s values=[%s%s]", name, tuple(tensor.shape), ", ".join(values), suffix)
+
+
+def _log_first_vertices(label: str, vertices: torch.Tensor) -> None:
+    count = min(3, vertices.size(0))
+    LOGGER.info("%s first %d vertices: %s", label, count, vertices[:count].detach().cpu().tolist())
+
+
+def _manual_centered_corr(pred: torch.Tensor, target: torch.Tensor) -> float:
+    pred_flat = pred.detach().float().reshape(-1)
+    target_flat = target.detach().float().reshape(-1)
+    pred_centered = pred_flat - pred_flat.mean()
+    target_centered = target_flat - target_flat.mean()
+    denom = torch.sqrt(torch.sum(pred_centered ** 2) * torch.sum(target_centered ** 2))
+    if denom.item() == 0:
+        return 0.0
+    return (torch.sum(pred_centered * target_centered) / (denom + 1e-12)).item()
+
+
 def _validate_asset_paths() -> None:
-    print(CHECKPOINT)
-    print(NORM_STATS_FILE)
-    print(GEOM_PARAM_FILE)
+    LOGGER.info("Checkpoint path: %s", CHECKPOINT)
+    LOGGER.info("Normalization stats path: %s", NORM_STATS_FILE)
+    LOGGER.info("Geometry config path: %s", GEOM_PARAM_FILE)
     required = {
         "checkpoint": CHECKPOINT,
         "normalization stats": NORM_STATS_FILE,
@@ -408,6 +491,37 @@ def _compute_edge_length_stats(
     return torch.stack([mean, min_len, max_len, std], dim=1)
 
 
+def _assert_preprocessing_contract(
+    prepared: PreparedMesh,
+    flow_params: torch.Tensor,
+    geom_params: torch.Tensor,
+) -> None:
+    x = prepared.x_fp32
+    vertices = prepared.vertices
+
+    assert x.shape[1] == NODE_IN_DIM, (
+        f"Feature width mismatch: got {x.shape[1]}, expected NODE_IN_DIM={NODE_IN_DIM}. "
+        f"Expected order: {FEATURE_LAYOUT}"
+    )
+    assert prepared.edge_attr.shape[1] == EDGE_DIM, (
+        f"Edge feature width mismatch: got {prepared.edge_attr.shape[1]}, expected EDGE_DIM={EDGE_DIM}."
+    )
+    assert torch.allclose(x[:, :3], vertices, atol=1e-6), "Feature order mismatch: x[:, 0:3] must be xyz."
+    assert torch.allclose(x[:, 3:8], flow_params, atol=1e-6), "Feature order mismatch: x[:, 3:8] must be flow."
+    assert torch.allclose(x[:, 8:18], geom_params, atol=1e-6), "Feature order mismatch: x[:, 8:18] must be geom."
+    assert torch.allclose(x[:, 22:23], torch.clamp(x[:, 22:23], min=0.0), atol=1e-6), (
+        "Feature order mismatch: local_area should be non-negative at x[:, 22:23]."
+    )
+    assert torch.allclose(prepared.edge_attr, _compute_edge_attr(vertices, prepared.edge_index), atol=1e-5), (
+        "edge_attr does not match edge_index and normalized xyz."
+    )
+    assert torch.allclose(prepared.vertices[:, :2], x[:, :2], atol=1e-6), "pos must equal normalized xyz[:, :2]."
+    assert torch.isfinite(x).all(), "Non-finite values found in inference x_fp32."
+    assert torch.isfinite(prepared.edge_attr).all(), "Non-finite values found in inference edge_attr."
+    assert abs(float(vertices.mean().item())) < 5e-3, "Normalized vertices are not centered near zero."
+    assert vertices.abs().max().item() <= 1.0001, "Normalized vertices exceed [-1, 1]."
+
+
 def _prepare_mesh(
     vtk_path: str,
     input_json: dict[str, Any],
@@ -474,19 +588,41 @@ def _prepare_mesh(
     if "cp" in surf.point_data:
         cp_true = torch.tensor(surf.point_data["cp"], dtype=torch.float32)
 
-    return PreparedMesh(
+    prepared = PreparedMesh(
         mesh=surf,
         vertices=vertices,
         edge_index=edge_index,
         edge_attr=edge_attr,
         x_fp32=x_fp32,
         cp_true=cp_true,
+        center=center,
+        scale=float(scale),
     )
+    _assert_preprocessing_contract(prepared, flow_params, geom_params)
+
+    LOGGER.info("Inference feature layout: %s", " | ".join(FEATURE_LAYOUT))
+    LOGGER.info("Inference vertex normalization center=%s scale=%.6e", center.tolist(), float(scale))
+    _log_first_vertices("Inference VTK normalized", vertices)
+    LOGGER.info(
+        "Inference tensor shapes: x=%s xyz=%s pos=%s edge_index=%s edge_attr=%s",
+        tuple(x_fp32.shape),
+        tuple(vertices.shape),
+        tuple(vertices[:, :2].shape),
+        tuple(edge_index.shape),
+        tuple(edge_attr.shape),
+    )
+    LOGGER.info("%s", _tensor_stats("Inference edge_attr", edge_attr))
+    LOGGER.info("%s", _tensor_stats("Inference x_fp32", x_fp32))
+
+    return prepared
 
 
 def _compute_metrics(
     cp_pred: torch.Tensor,
     cp_true: torch.Tensor | None,
+    cp_pred_norm: torch.Tensor | None = None,
+    cp_mean: torch.Tensor | None = None,
+    cp_std: torch.Tensor | None = None,
 ) -> dict[str, float | None]:
     if cp_true is None:
         return _empty_metrics()
@@ -498,17 +634,20 @@ def _compute_metrics(
     rel_l2 = (torch.norm(diff) / (torch.norm(cp_true) + 1e-8)).item()
     max_abs_error = torch.max(torch.abs(diff)).item()
 
-    corr = np.corrcoef(
-        cp_true.numpy().flatten(),
-        cp_pred.numpy().flatten(),
-    )[0, 1]
+    corr_after_denorm = _manual_centered_corr(cp_pred, cp_true)
+    corr_before_denorm = None
+    if cp_pred_norm is not None and cp_mean is not None and cp_std is not None:
+        cp_true_norm = normalize(cp_true, cp_mean, cp_std)
+        corr_before_denorm = _manual_centered_corr(cp_pred_norm, cp_true_norm)
 
     return {
         "rmse": float(rmse),
         "mae": float(mae),
         "mse": float(mse),
         "rel_l2": float(rel_l2),
-        "corr": float(corr),
+        "corr": float(corr_after_denorm),
+        "corr_before_denorm": float(corr_before_denorm) if corr_before_denorm is not None else None,
+        "corr_after_denorm": float(corr_after_denorm),
         "max_abs_error": float(max_abs_error),
     }
 
@@ -520,6 +659,8 @@ def _empty_metrics() -> dict[str, None]:
         "mse": None,
         "rel_l2": None,
         "corr": None,
+        "corr_before_denorm": None,
+        "corr_after_denorm": None,
         "max_abs_error": None,
     }
 
@@ -579,6 +720,8 @@ def _write_report(
         f"MSE: {_format_value(metrics['mse'])}",
         f"Relative L2: {_format_value(metrics['rel_l2'])}",
         f"Correlation: {_format_value(metrics['corr'])}",
+        f"Correlation before denorm: {_format_value(metrics['corr_before_denorm'])}",
+        f"Correlation after denorm: {_format_value(metrics['corr_after_denorm'])}",
         f"Maximum Error: {_format_value(metrics['max_abs_error'])}",
         "",
         "Force coefficients",

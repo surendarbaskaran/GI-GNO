@@ -1,5 +1,6 @@
 import os
 import gc
+import shutil
 import torch
 import pyvista as pv
 import configparser
@@ -12,6 +13,16 @@ from config import *
 
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+FEATURE_LAYOUT = (
+    "xyz[0:3]",
+    "flow[3:8]",
+    "geom[8:18]",
+    "curvature[18:19]",
+    "normal[19:22]",
+    "local_area[22:23]",
+    "edge_stats[23:27]",
+)
 
 # ============================================
 # MEMORY OPTIMIZATION
@@ -168,6 +179,26 @@ def compute_edge_length_stats(vertices, mesh_edge_index):
 
     min_len = torch.where(torch.isfinite(min_len), min_len, torch.zeros_like(min_len))
     return torch.stack([mean, min_len, max_len, std], dim=1)
+
+
+def assert_feature_contract(x_fp32, vertices, flow_params, geom_params, edge_index, edge_attr):
+    assert x_fp32.shape[1] == NODE_IN_DIM, (
+        f"Feature width mismatch: got {x_fp32.shape[1]}, expected NODE_IN_DIM={NODE_IN_DIM}. "
+        f"Expected order: {FEATURE_LAYOUT}"
+    )
+    assert edge_attr.shape[1] == EDGE_DIM, (
+        f"Edge feature width mismatch: got {edge_attr.shape[1]}, expected EDGE_DIM={EDGE_DIM}."
+    )
+    assert torch.allclose(x_fp32[:, :3], vertices, atol=1e-6), "x[:, 0:3] must be xyz."
+    assert torch.allclose(x_fp32[:, 3:8], flow_params, atol=1e-6), "x[:, 3:8] must be flow."
+    assert torch.allclose(x_fp32[:, 8:18], geom_params, atol=1e-6), "x[:, 8:18] must be geom."
+    assert torch.allclose(edge_attr, compute_edge_attr(vertices, edge_index), atol=1e-5), (
+        "edge_attr does not match edge_index and normalized xyz."
+    )
+    assert torch.isfinite(x_fp32).all(), "x_fp32 contains non-finite values."
+    assert torch.isfinite(edge_attr).all(), "edge_attr contains non-finite values."
+    assert abs(float(vertices.mean().item())) < 5e-3, "Normalized vertices are not centered near zero."
+    assert vertices.abs().max().item() <= 1.0001, "Normalized vertices exceed [-1, 1]."
 
 
 ############################################
@@ -415,6 +446,7 @@ def build_case_tensors(row, geom_config):
         ],
         dim=1,
     )
+    assert_feature_contract(x_fp32, vertices, flow_params, geom_params, edge_index, edge_attr)
     del geom_params, flow_params  # Free components
 
     ########################################################
@@ -477,6 +509,7 @@ def preprocess_case(case_pack, x_mean, x_std, cp_mean, cp_std):
         "cell_areas": case_pack["cell_areas"],
         "y_cp": y_cp,
         "meta": {
+            "case_name": case_pack["case_name"],
             "x_mean": x_mean,
             "x_std": x_std,
             "y_cp_mean": cp_mean,
@@ -532,6 +565,16 @@ def main():
             pack = build_case_tensors(row, geom_config)
             if pack is None:
                 continue
+
+            if processed_count == 0:
+                print("==== PREPROCESSING RAW CHECK ====")
+                print(f"Feature order: {' | '.join(FEATURE_LAYOUT)}")
+                print(f"Case: {pack['case_name']}")
+                print(f"First 3 normalized vertices: {pack['x_fp32'][:3, :3].tolist()}")
+                print(f"x_fp32 shape: {tuple(pack['x_fp32'].shape)}")
+                print(f"edge_index shape: {tuple(pack['edge_index'].shape)}")
+                print(f"edge_attr shape: {tuple(pack['edge_attr'].shape)}")
+                print("==== END PREPROCESSING RAW CHECK ====")
 
             x_stats.update(pack["x_fp32"])
 
