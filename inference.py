@@ -19,27 +19,33 @@ from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
 
 from config import (
+    C_REF,
     CHECKPOINT,
-    ATTENTION_HEADS,
-    ATTENTION_LOCAL_RADIUS,
-    ATTENTION_MAX_NODES,
-    ATTENTION_QUERY_CHUNK_SIZE,
     DEVICE,
     DROPOUT,
     EDGE_DIM,
     FOURIER_BANDS,
     GEOM_PARAM_FILE,
-    GRID_SIZE,
+    GNO_FUSION,
     HIDDEN_DIM,
     KNN_K,
     NODE_IN_DIM,
     NORM_STATS_FILE,
+    NUM_ENCODER_LAYERS,
+    NUM_GNO_BRANCHES,
+    NUM_GNO_LAYERS,
+    NUM_DECODER_LAYERS,
     NUM_GNN_LAYERS,
     OUT_DIM,
+    OUT_VTK_DIR,
+    S_REF,
+    X_REF,
+    Z_REF,
+    setup_run_logger,
 )
-from model import GAGNO
+from model import EncoderGNODecoder, EncoderDecoder, GAGNO
 
-OUTPUT_DIR = "/tmp/output"
+OUTPUT_DIR = OUT_VTK_DIR if OUT_VTK_DIR else "/tmp/output"
 FLOW_KEYS = ("alt_kft", "Re", "M_inf", "alpha_deg", "beta_deg")
 GEOM_KEYS = ("B1", "B2", "B3", "C1", "C2", "C3", "C4", "S1", "S2", "S3")
 FEATURE_LAYOUT = (
@@ -84,6 +90,7 @@ class PreparedMesh:
     cp_true: torch.Tensor | None
     center: np.ndarray
     scale: float
+    cf_true: torch.Tensor | None = None
 
 
 _STATE: InferenceState | None = None
@@ -100,26 +107,86 @@ def load_model() -> InferenceState:
     device = torch.device(DEVICE)
     LOGGER.info("Loading GI-GNO model on %s", device)
 
-    model = GAGNO(
+    checkpoint = torch.load(CHECKPOINT, map_location=device, weights_only=False)
+    raw_state_dict = _extract_state_dict(checkpoint)
+    state_dict = {
+        k.replace("_orig_mod.", ""): v
+        for k, v in raw_state_dict.items()
+    }
+
+    # Automatically detect trained parallel GNO branches & per-branch layer counts from checkpoint
+    detected_gno_branches = 0
+    while any(f"gno.branches.{detected_gno_branches}." in k for k in state_dict):
+        detected_gno_branches += 1
+
+    detected_gno_layers: int | list[int] = 0
+    if detected_gno_branches > 0:
+        branch_layer_counts = []
+        for b in range(detected_gno_branches):
+            b_layers = 0
+            while any(f"gno.branches.{b}.layers.{b_layers}." in k for k in state_dict):
+                b_layers += 1
+            branch_layer_counts.append(b_layers)
+        if all(k > 0 for k in branch_layer_counts):
+            detected_gno_layers = branch_layer_counts
+    else:
+        single_layers = 0
+        while any(f"gno.layers.{single_layers}." in k for k in state_dict):
+            single_layers += 1
+        detected_gno_layers = single_layers
+
+    detected_enc_layers = 0
+    while any(f"encoder.layers.{detected_enc_layers}." in k for k in state_dict):
+        detected_enc_layers += 1
+
+    detected_dec_layers = 0
+    while any(f"decoder.layers.{detected_dec_layers}." in k for k in state_dict):
+        detected_dec_layers += 1
+
+    detected_gnn_layers = 0
+    while any(f"gnn.layers.{detected_gnn_layers}." in k for k in state_dict):
+        detected_gnn_layers += 1
+
+    detected_hidden_dim = HIDDEN_DIM
+    if "encoder.input_proj.0.weight" in state_dict:
+        detected_hidden_dim = int(state_dict["encoder.input_proj.0.weight"].shape[0])
+
+    gno_branches = detected_gno_branches if detected_gno_branches > 0 else NUM_GNO_BRANCHES
+    gno_layers = (
+        detected_gno_layers
+        if (isinstance(detected_gno_layers, list) or detected_gno_layers > 0)
+        else NUM_GNO_LAYERS
+    )
+    enc_layers = detected_enc_layers if detected_enc_layers > 0 else NUM_ENCODER_LAYERS
+    dec_layers = detected_dec_layers if detected_dec_layers > 0 else NUM_DECODER_LAYERS
+    gnn_layers = detected_gnn_layers if detected_gnn_layers > 0 else NUM_GNN_LAYERS
+
+    LOGGER.info(
+        "Configured model depth: hidden_dim=%d, %d encoder, %d parallel GNO branches (layers=%s), %d decoder, %d GNN layers",
+        detected_hidden_dim,
+        enc_layers,
+        gno_branches,
+        gno_layers,
+        dec_layers,
+        gnn_layers,
+    )
+
+    model = EncoderGNODecoder(
         node_in_dim=NODE_IN_DIM,
-        hidden_dim=HIDDEN_DIM,
+        hidden_dim=detected_hidden_dim,
         out_dim=OUT_DIM,
-        num_gnn_layers=NUM_GNN_LAYERS,
-        grid_size=GRID_SIZE,
+        num_encoder_layers=enc_layers,
+        num_gno_branches=gno_branches,
+        num_gno_layers=gno_layers,
+        gno_fusion=GNO_FUSION,
+        num_decoder_layers=dec_layers,
+        num_gnn_layers=gnn_layers,
         edge_dim=EDGE_DIM,
         dropout=DROPOUT,
         fourier_bands=FOURIER_BANDS,
-        attention_heads=ATTENTION_HEADS,
-        attention_query_chunk_size=ATTENTION_QUERY_CHUNK_SIZE,
-        attention_max_nodes=ATTENTION_MAX_NODES,
-        attention_local_radius=ATTENTION_LOCAL_RADIUS,
+        use_checkpoint=False,
     ).to(device)
 
-    checkpoint = torch.load(CHECKPOINT, map_location=device)
-    state_dict = {
-                    k.replace("_orig_mod.", ""): v
-                    for k, v in checkpoint.items()
-                }
     incompatible = model.load_state_dict(state_dict, strict=False)
     if incompatible.missing_keys:
         LOGGER.warning(
@@ -133,7 +200,7 @@ def load_model() -> InferenceState:
         )
     model.eval()
 
-    norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu")
+    norm_stats = torch.load(NORM_STATS_FILE, map_location="cpu", weights_only=False)
     geom_config = configparser.ConfigParser()
     geom_config.read(GEOM_PARAM_FILE)
 
@@ -150,138 +217,59 @@ def load_model() -> InferenceState:
     return _STATE
 
 
-def run_inference(vtk_path: str, input_json: dict[str, Any]) -> dict[str, Any]:
-    """Run prediction for one uploaded VTK and return structured results."""
-
-    start_time = time.time()
-    try:
-        state = load_model()
-        inputs = _validate_request(vtk_path, input_json, state.geom_config)
-        prepared = _prepare_mesh(vtk_path, inputs, state.geom_config)
-
-        _log_vector("x_mean", state.x_mean)
-        _log_vector("x_std", state.x_std)
-        _log_vector("cp_mean", state.cp_mean)
-        _log_vector("cp_std", state.cp_std)
-        assert state.x_mean.numel() == NODE_IN_DIM, (
-            f"x_mean width {state.x_mean.numel()} does not match NODE_IN_DIM={NODE_IN_DIM}."
-        )
-        assert state.x_std.numel() == NODE_IN_DIM, (
-            f"x_std width {state.x_std.numel()} does not match NODE_IN_DIM={NODE_IN_DIM}."
-        )
-
-        x = normalize(prepared.x_fp32, state.x_mean, state.x_std)
-        assert torch.isfinite(x).all(), "Non-finite values found after inference feature normalization."
-        LOGGER.info("%s", _tensor_stats("Inference x_norm", x))
-        data = Data(
-            x=x,
-            xyz=prepared.vertices,
-            edge_index=prepared.edge_index,
-            edge_attr=prepared.edge_attr,
-            pos=prepared.vertices[:, :2],
-        ).to(state.device)
-        assert torch.allclose(data.pos.cpu(), data.xyz[:, :2].cpu(), atol=1e-6), (
-            "Inference Data.pos must equal Data.xyz[:, :2]."
-        )
-
-        with torch.no_grad():
-            cp_pred_norm = state.model(data).cpu().squeeze()
-            cp_pred = cp_pred_norm * state.cp_std + state.cp_mean
-
-        LOGGER.info("%s", _tensor_stats("pred_norm", cp_pred_norm))
-        LOGGER.info("%s", _tensor_stats("pred", cp_pred))
-        if prepared.cp_true is not None:
-            cp_true_norm = normalize(prepared.cp_true, state.cp_mean, state.cp_std)
-            corr_before_denorm = _manual_centered_corr(cp_pred_norm, cp_true_norm)
-            corr_after_denorm = _manual_centered_corr(cp_pred, prepared.cp_true)
-            LOGGER.info("corr_before_denorm=%.6f", corr_before_denorm)
-            LOGGER.info("corr_after_denorm=%.6f", corr_after_denorm)
-            LOGGER.info("%s", _tensor_stats("GT", prepared.cp_true))
-            LOGGER.info("%s", _tensor_stats("Prediction", cp_pred))
-
-        metrics = _compute_metrics(
-            cp_pred,
-            prepared.cp_true,
-            cp_pred_norm=cp_pred_norm,
-            cp_mean=state.cp_mean,
-            cp_std=state.cp_std,
-        )
-        cl_pred, cd_pred = compute_force_coefficients(
-            prepared.mesh,
-            cp_pred,
-            inputs["alpha_deg"],
-        )
-        output_vtk = _save_prediction_vtk(
-            vtk_path,
-            prepared.mesh,
-            cp_pred,
-            prepared.cp_true,
-        )
-        elapsed = time.time() - start_time
-        report_path = _write_report(
-            output_vtk=output_vtk,
-            vtk_path=vtk_path,
-            input_json=inputs,
-            metrics=metrics,
-            forces={"CL": cl_pred, "CD": cd_pred},
-            elapsed=elapsed,
-        )
-
-        return {
-            "success": True,
-            "output_vtk": output_vtk,
-            "report": report_path,
-            "vertices": int(prepared.mesh.n_points),
-            "faces": int(prepared.mesh.n_cells),
-            "inference_time": elapsed,
-            "metrics": metrics,
-            "forces": {
-                "CL": cl_pred,
-                "CD": cd_pred,
-            },
-        }
-    except Exception as exc:  # noqa: BLE001 - UI/API should receive readable errors.
-        LOGGER.exception("Inference failed")
-        return {
-            "success": False,
-            "error": str(exc),
-            "output_vtk": None,
-            "report": None,
-            "vertices": None,
-            "faces": None,
-            "inference_time": None,
-            "metrics": _empty_metrics(),
-            "forces": {
-                "CL": None,
-                "CD": None,
-            },
-        }
-
-
 def compute_force_coefficients(
     mesh: pv.DataSet,
     cp_values: torch.Tensor,
     alpha_deg: float,
-) -> tuple[float, float]:
-    """Compute CL and CD from the predicted Cp distribution."""
+    beta_deg: float = 0.0,
+    cf_values: torch.Tensor | None = None,
+) -> tuple[float, float, float]:
+    """Compute CL, CD, and CMy from the predicted Cp (and optional Cf) distribution."""
 
     alpha = np.deg2rad(alpha_deg)
-    surf = mesh.extract_surface().triangulate()
+    beta = np.deg2rad(beta_deg)
+    surf = mesh.extract_surface(algorithm="dataset_surface").triangulate()
     surf = surf.compute_normals(cell_normals=True, point_normals=False)
     surf = surf.compute_cell_sizes()
 
-    areas = np.array(surf.cell_data["Area"])
-    normals = np.array(surf.cell_data["Normals"])
+    raw_points = np.array(surf.points, dtype=np.float32)
     faces = surf.faces.reshape(-1, 4)[:, 1:]
-    cp_point = cp_values.detach().cpu().numpy()
+    cell_centers = raw_points[faces].mean(axis=1)
+
+    raw_y = raw_points[:, 1]
+    y_min, y_max = float(np.min(raw_y)), float(np.max(raw_y))
+    symmetry_factor = 2.0 if (abs(y_min) < 1e-4 or abs(y_max) < 1e-4) else 1.0
+
+    areas = np.array(surf.cell_data["Area"], dtype=np.float32) * symmetry_factor
+    normals = np.array(surf.cell_data["Normals"], dtype=np.float32).copy()
+
+    z_coords = cell_centers[:, 2]
+    upper_mask = z_coords > np.median(z_coords)
+    if np.any(upper_mask) and np.mean(normals[upper_mask, 2]) < 0:
+        normals = -normals
+
+    cp_arr = cp_values.detach().cpu().numpy()
+    if cp_arr.ndim == 2 and cp_arr.shape[1] == 4:
+        cp_point = cp_arr[:, 0]
+        cf_point = cp_arr[:, 1:4]
+    else:
+        cp_point = cp_arr.reshape(-1)
+        cf_point = cf_values.detach().cpu().numpy() if cf_values is not None else None
+
     cp_cell = cp_point[faces].mean(axis=1)
+    if cf_point is not None:
+        cf_cell = cf_point[faces].mean(axis=1)
+    else:
+        cf_cell = np.zeros((faces.shape[0], 3), dtype=np.float32)
 
-    fx_total = (-cp_cell * normals[:, 0] * areas).sum()
-    fz_total = (-cp_cell * normals[:, 2] * areas).sum()
+    dF_total = (-cp_cell[:, None] * normals + cf_cell) * areas[:, None]
+    F_total = dF_total.sum(axis=0)
+    CX, CY, CZ = F_total[0] / S_REF, F_total[1] / S_REF, F_total[2] / S_REF
 
-    cd = fx_total * np.cos(alpha) + fz_total * np.sin(alpha)
-    cl = -fx_total * np.sin(alpha) + fz_total * np.cos(alpha)
-    return float(cl), float(cd)
+    cd = CX * np.cos(alpha) * np.cos(beta) + CY * np.sin(beta) + CZ * np.sin(alpha) * np.cos(beta)
+    cl = -CX * np.sin(alpha) + CZ * np.cos(alpha)
+    cmy = ((cell_centers[:, 2] - Z_REF) * dF_total[:, 0] - (cell_centers[:, 0] - X_REF) * dF_total[:, 2]).sum() / (S_REF * C_REF)
+    return float(cl), float(cd), float(cmy)
 
 
 def normalize(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -345,13 +333,16 @@ def _validate_asset_paths() -> None:
 
 
 def _extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        return checkpoint["model"]
-    if isinstance(checkpoint, dict) and any(
-        key.startswith("encoder") or key.startswith("decoder")
-        for key in checkpoint
-    ):
-        return checkpoint
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            return checkpoint["model_state_dict"]
+        if "model" in checkpoint:
+            return checkpoint["model"]
+        if any(
+            key.startswith("encoder") or key.startswith("decoder") or key.startswith("gno")
+            for key in checkpoint
+        ):
+            return checkpoint
     return checkpoint
 
 
@@ -404,6 +395,19 @@ def _build_knn_edges(vertices: torch.Tensor, k: int) -> torch.Tensor:
         return torch.empty((2, 0), dtype=torch.long)
 
     k = min(k, num_nodes - 1)
+    try:
+        from scipy.spatial import cKDTree
+        pts = vertices.detach().cpu().numpy()
+        tree = cKDTree(pts)
+        _, indices = tree.query(pts, k=k + 1, workers=-1)
+        nn_idx = indices[:, 1:]
+        src = np.repeat(np.arange(num_nodes), k)
+        dst = nn_idx.reshape(-1)
+        edges = torch.tensor(np.stack([src, dst], axis=0), dtype=torch.long)
+        return to_undirected(edges)
+    except Exception:
+        pass
+
     edge_chunks = []
     chunk_size = 4096
     for start in range(0, num_nodes, chunk_size):
@@ -419,14 +423,21 @@ def _build_knn_edges(vertices: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _merge_edge_indices(*edge_indices: torch.Tensor) -> torch.Tensor:
-    edge_index = torch.cat([edge for edge in edge_indices if edge.numel() > 0], dim=1)
-    return torch.unique(edge_index.T, dim=0).T.contiguous()
+    edges = [e for e in edge_indices if e.numel() > 0]
+    if not edges:
+        return torch.empty((2, 0), dtype=torch.long)
+    cat_edges = torch.cat(edges, dim=1)
+    max_node = cat_edges.max().item() + 1
+    edge_hash = cat_edges[0] * max_node + cat_edges[1]
+    unique_hash = torch.unique(edge_hash)
+    edge_index = torch.stack([unique_hash // max_node, unique_hash % max_node], dim=0)
+    return edge_index.contiguous()
 
 
 def _compute_edge_attr(vertices: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     src, dst = edge_index
     rel_xyz = vertices[dst] - vertices[src]
-    distance = torch.linalg.norm(rel_xyz, dim=1, keepdim=True)
+    distance = torch.sqrt(torch.sum(rel_xyz * rel_xyz, dim=1, keepdim=True) + 1e-12)
     direction = rel_xyz / (distance + 1e-8)
     edge_length = distance
     return torch.cat([edge_length, rel_xyz, distance, direction], dim=1)
@@ -515,11 +526,11 @@ def _assert_preprocessing_contract(
     assert torch.allclose(prepared.edge_attr, _compute_edge_attr(vertices, prepared.edge_index), atol=1e-5), (
         "edge_attr does not match edge_index and normalized xyz."
     )
-    assert torch.allclose(prepared.vertices[:, :2], x[:, :2], atol=1e-6), "pos must equal normalized xyz[:, :2]."
+    assert torch.allclose(prepared.vertices, x[:, :3], atol=1e-6), "vertices must equal normalized xyz."
     assert torch.isfinite(x).all(), "Non-finite values found in inference x_fp32."
     assert torch.isfinite(prepared.edge_attr).all(), "Non-finite values found in inference edge_attr."
-    assert abs(float(vertices.mean().item())) < 5e-3, "Normalized vertices are not centered near zero."
-    assert vertices.abs().max().item() <= 1.0001, "Normalized vertices exceed [-1, 1]."
+    assert vertices[:, 0].min() >= -1e-4, f"Vertices x-coordinate must start at >= 0.0, got {vertices[:, 0].min()}"
+    assert vertices[:, 0].max() <= 1.0001, f"Vertices x-coordinate must end at <= 1.0, got {vertices[:, 0].max()}"
 
 
 def _prepare_mesh(
@@ -529,19 +540,37 @@ def _prepare_mesh(
 ) -> PreparedMesh:
     mesh = pv.read(vtk_path)
     mesh = mesh.connectivity(extraction_mode="largest")
-    surf = mesh.extract_surface().triangulate()
+    surf = mesh.extract_surface(algorithm="dataset_surface").triangulate()
     surf = surf.compute_normals(cell_normals=True, point_normals=False)
     surf = surf.compute_cell_sizes()
 
     vertices_np = surf.points.astype(np.float32)
-    center = vertices_np.mean(axis=0)
-    vertices_np -= center
-    scale = np.max(np.abs(vertices_np))
-    vertices_np /= scale + 1e-8
-    vertices = torch.tensor(vertices_np, dtype=torch.float32)
+    x_min = float(np.min(vertices_np[:, 0]))
+    x_max = float(np.max(vertices_np[:, 0]))
+    chord = max(x_max - x_min, 1e-8)
 
-    faces = torch.tensor(surf.faces.reshape(-1, 4)[:, 1:], dtype=torch.long)
-    cell_normals = torch.tensor(surf.cell_data["Normals"], dtype=torch.float32)
+    nose_idx = int(np.argmin(vertices_np[:, 0]))
+    nose_y = float(vertices_np[nose_idx, 1])
+    nose_z = float(vertices_np[nose_idx, 2])
+
+    vertices_np[:, 0] = (vertices_np[:, 0] - x_min) / chord
+    vertices_np[:, 1] = (vertices_np[:, 1] - nose_y) / chord
+    vertices_np[:, 2] = (vertices_np[:, 2] - nose_z) / chord
+    vertices_np[:, 0] = np.clip(vertices_np[:, 0], 0.0, 1.0)
+    vertices = torch.tensor(vertices_np, dtype=torch.float32)
+    center = np.array([x_min, nose_y, nose_z], dtype=np.float32)
+    scale = float(chord)
+
+    faces_np = surf.faces.reshape(-1, 4)[:, 1:]
+    faces = torch.tensor(faces_np, dtype=torch.long)
+    raw_points = surf.points.astype(np.float32)
+    cell_centers_np = raw_points[faces_np].mean(axis=1)
+    normals_np = np.array(surf.cell_data["Normals"], dtype=np.float32).copy()
+    z_coords = cell_centers_np[:, 2]
+    upper_mask = z_coords > np.median(z_coords)
+    if np.any(upper_mask) and np.mean(normals_np[upper_mask, 2]) < 0:
+        normals_np = -normals_np
+    cell_normals = torch.tensor(normals_np, dtype=torch.float32)
     normalized_cell_areas = 0.5 * torch.linalg.norm(
         torch.cross(
             vertices[faces[:, 1]] - vertices[faces[:, 0]],
@@ -588,6 +617,18 @@ def _prepare_mesh(
     if "cp" in surf.point_data:
         cp_true = torch.tensor(surf.point_data["cp"], dtype=torch.float32)
 
+    cf_true = None
+    if all(k in surf.point_data for k in ("cf_x", "cf_y", "cf_z")):
+        cf_true = torch.tensor(
+            np.stack(
+                [surf.point_data["cf_x"], surf.point_data["cf_y"], surf.point_data["cf_z"]],
+                axis=1,
+            ),
+            dtype=torch.float32,
+        )
+    elif "cf" in surf.point_data and np.asarray(surf.point_data["cf"]).ndim == 2 and np.asarray(surf.point_data["cf"]).shape[1] == 3:
+        cf_true = torch.tensor(surf.point_data["cf"], dtype=torch.float32)
+
     prepared = PreparedMesh(
         mesh=surf,
         vertices=vertices,
@@ -597,6 +638,7 @@ def _prepare_mesh(
         cp_true=cp_true,
         center=center,
         scale=float(scale),
+        cf_true=cf_true,
     )
     _assert_preprocessing_contract(prepared, flow_params, geom_params)
 
@@ -607,7 +649,7 @@ def _prepare_mesh(
         "Inference tensor shapes: x=%s xyz=%s pos=%s edge_index=%s edge_attr=%s",
         tuple(x_fp32.shape),
         tuple(vertices.shape),
-        tuple(vertices[:, :2].shape),
+        tuple(vertices.shape),
         tuple(edge_index.shape),
         tuple(edge_attr.shape),
     )
@@ -689,7 +731,7 @@ def _write_report(
     vtk_path: str,
     input_json: dict[str, Any],
     metrics: dict[str, float | None],
-    forces: dict[str, float],
+    forces: dict[str, float | None],
     elapsed: float,
 ) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -726,8 +768,15 @@ def _write_report(
         "",
         "Force coefficients",
         "-" * 18,
-        f"CL: {_format_value(forces['CL'])}",
-        f"CD: {_format_value(forces['CD'])}",
+        f"CL_pred: {_format_value(forces['CL'])}",
+        f"CD_pred: {_format_value(forces['CD'])}",
+        f"CMy_pred: {_format_value(forces.get('CMy'))}",
+        f"CL_true (GT Cp int): {_format_value(forces.get('CL_true'))}",
+        f"CD_true (GT Cp int): {_format_value(forces.get('CD_true'))}",
+        f"CMy_true (GT Cp int): {_format_value(forces.get('CMy_true'))}",
+        f"CL %Error: {_format_value(forces.get('CL_pct_error'))}",
+        f"CD %Error: {_format_value(forces.get('CD_pct_error'))}",
+        f"CMy %Error: {_format_value(forces.get('CMy_pct_error'))}",
     ]
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(report_path)
@@ -739,11 +788,173 @@ def _format_value(value: float | None) -> str:
     return f"{value:.6e}"
 
 
-def main() -> None:
-    """Preserve script entry point with a clear interactive-app hint."""
+def run_inference(vtk_path: str, input_json: dict[str, Any]) -> dict[str, Any]:
+    """Run prediction for one uploaded VTK and return structured results."""
 
-    LOGGER.info("Use inference_gradio.py or call run_inference(vtk_path, input_json).")
+    log_path = setup_run_logger("inference", reuse_active=True)
+    start_time = time.time()
+    try:
+        LOGGER.info("Starting inference for %s (log_file=%s)", vtk_path, log_path)
+        state = load_model()
+        inputs = _validate_request(vtk_path, input_json, state.geom_config)
+        prepared = _prepare_mesh(vtk_path, inputs, state.geom_config)
+
+        _log_vector("x_mean", state.x_mean)
+        _log_vector("x_std", state.x_std)
+        _log_vector("cp_mean", state.cp_mean)
+        _log_vector("cp_std", state.cp_std)
+        assert state.x_mean.numel() == NODE_IN_DIM, (
+            f"x_mean width {state.x_mean.numel()} does not match NODE_IN_DIM={NODE_IN_DIM}."
+        )
+        assert state.x_std.numel() == NODE_IN_DIM, (
+            f"x_std width {state.x_std.numel()} does not match NODE_IN_DIM={NODE_IN_DIM}."
+        )
+
+        x = normalize(prepared.x_fp32, state.x_mean, state.x_std)
+        assert torch.isfinite(x).all(), "Non-finite values found after inference feature normalization."
+        LOGGER.info("%s", _tensor_stats("Inference x_norm", x))
+        data = Data(
+            x=x,
+            xyz=prepared.vertices,
+            edge_index=prepared.edge_index,
+            edge_attr=prepared.edge_attr,
+            pos=prepared.vertices,
+        ).to(state.device)
+        assert torch.allclose(data.pos.cpu(), data.xyz.cpu(), atol=1e-6), (
+            "Inference Data.pos must equal Data.xyz."
+        )
+
+        with torch.no_grad():
+            raw_pred = state.model(data).cpu()
+            if raw_pred.dim() == 2 and raw_pred.size(-1) == 4:
+                cp_pred_norm = raw_pred[:, 0]
+                cf_pred = raw_pred[:, 1:4]
+            else:
+                cp_pred_norm = raw_pred.reshape(-1)
+                cf_pred = prepared.cf_true
+            cp_pred = cp_pred_norm * state.cp_std.reshape(-1) + state.cp_mean.reshape(-1)
+
+        LOGGER.info("%s", _tensor_stats("pred_norm", cp_pred_norm))
+        LOGGER.info("%s", _tensor_stats("pred", cp_pred))
+        if prepared.cp_true is not None:
+            cp_true_norm = normalize(prepared.cp_true, state.cp_mean, state.cp_std)
+            corr_before_denorm = _manual_centered_corr(cp_pred_norm, cp_true_norm)
+            corr_after_denorm = _manual_centered_corr(cp_pred, prepared.cp_true)
+            LOGGER.info("corr_before_denorm=%.6f", corr_before_denorm)
+            LOGGER.info("corr_after_denorm=%.6f", corr_after_denorm)
+            LOGGER.info("%s", _tensor_stats("GT", prepared.cp_true))
+            LOGGER.info("%s", _tensor_stats("Prediction", cp_pred))
+
+        metrics = _compute_metrics(
+            cp_pred,
+            prepared.cp_true,
+            cp_pred_norm=cp_pred_norm,
+            cp_mean=state.cp_mean,
+            cp_std=state.cp_std,
+        )
+        cl_pred, cd_pred, cmy_pred = compute_force_coefficients(
+            prepared.mesh,
+            cp_pred,
+            inputs["alpha_deg"],
+            beta_deg=inputs["beta_deg"],
+            cf_values=cf_pred,
+        )
+
+        cl_true, cd_true, cmy_true = None, None, None
+        cl_pct_err, cd_pct_err, cmy_pct_err = None, None, None
+        if prepared.cp_true is not None:
+            cl_true, cd_true, cmy_true = compute_force_coefficients(
+                prepared.mesh,
+                prepared.cp_true,
+                inputs["alpha_deg"],
+                beta_deg=inputs["beta_deg"],
+                cf_values=prepared.cf_true,
+            )
+            eps = 1e-3
+            cl_pct_err = abs(cl_pred - cl_true) / (abs(cl_true) + eps) * 100.0
+            cd_pct_err = abs(cd_pred - cd_true) / (abs(cd_true) + eps) * 100.0
+            cmy_pct_err = abs(cmy_pred - cmy_true) / (abs(cmy_true) + eps) * 100.0
+            LOGGER.info(
+                "Forces Pred: CL=%.6f, CD=%.6f, CMy=%.6f | GT Cp Int: CL=%.6f, CD=%.6f, CMy=%.6f | %%Err: CL=%.2f%%, CD=%.2f%%, CMy=%.2f%%",
+                cl_pred, cd_pred, cmy_pred,
+                cl_true, cd_true, cmy_true,
+                cl_pct_err, cd_pct_err, cmy_pct_err,
+            )
+        else:
+            LOGGER.info("Forces Pred: CL=%.6f, CD=%.6f, CMy=%.6f", cl_pred, cd_pred, cmy_pred)
+
+        output_vtk = _save_prediction_vtk(
+            vtk_path,
+            prepared.mesh,
+            cp_pred,
+            prepared.cp_true,
+        )
+        elapsed = time.time() - start_time
+        forces_payload = {
+            "CL": cl_pred,
+            "CD": cd_pred,
+            "CMy": cmy_pred,
+            "CL_true": cl_true,
+            "CD_true": cd_true,
+            "CMy_true": cmy_true,
+            "CL_pct_error": cl_pct_err,
+            "CD_pct_error": cd_pct_err,
+            "CMy_pct_error": cmy_pct_err,
+        }
+        report_path = _write_report(
+            output_vtk=output_vtk,
+            vtk_path=vtk_path,
+            input_json=inputs,
+            metrics=metrics,
+            forces=forces_payload,
+            elapsed=elapsed,
+        )
+        LOGGER.info(
+            "Inference completed in %.4fs | Output VTK: %s | Report: %s | Metrics: %s",
+            elapsed, output_vtk, report_path, metrics,
+        )
+
+        return {
+            "success": True,
+            "output_vtk": output_vtk,
+            "report": report_path,
+            "log_file": log_path,
+            "vertices": int(prepared.mesh.n_points),
+            "faces": int(prepared.mesh.n_cells),
+            "inference_time": elapsed,
+            "metrics": metrics,
+            "forces": forces_payload,
+        }
+    except Exception as exc:  # noqa: BLE001 - UI/API should receive readable errors.
+        LOGGER.exception("Inference failed")
+        return {
+            "success": False,
+            "error": str(exc),
+            "output_vtk": None,
+            "report": None,
+            "log_file": log_path,
+            "vertices": None,
+            "faces": None,
+            "inference_time": None,
+            "metrics": _empty_metrics(),
+            "forces": {
+                "CL": None,
+                "CD": None,
+                "CMy": None,
+            },
+        }
 
 
 if __name__ == "__main__":
-    main()
+    result = run_inference(
+        "dataset/testvtk/case_0473.vtk",
+        {
+            "geom_name": "geom_047",
+            "alt_kft": 2.541,
+            "Re": 21630000,
+            "M_inf": 0.4881,
+            "alpha_deg": 11.05,
+            "beta_deg": 0,
+        },
+    )
+    print(result)
