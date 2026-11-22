@@ -1,39 +1,63 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from torch_geometric.nn import GENConv
 
+from config import (
+    NODE_IN_DIM,
+    EDGE_DIM,
+    HIDDEN_DIM,
+    OUT_DIM,
+    NUM_ENCODER_LAYERS,
+    NUM_GNO_BRANCHES,
+    NUM_GNO_LAYERS,
+    GNO_FUSION,
+    NUM_DECODER_LAYERS,
+    NUM_GNN_LAYERS,
+    FOURIER_BANDS,
+    DROPOUT,
+    USE_GRAD_CHECKPOINT,
+    GNO_EDGE_CHUNK_SIZE,
+)
+
 
 ############################################
-# 1. GRAPH ENCODER
+# 1. FOURIER POSITION ENCODING
 ############################################
 
 class FourierPositionEncoding(nn.Module):
-    def __init__(self, num_bands=6):
+    """Multi-scale Fourier frequency embedding for coordinates starting at (0,0,0) to (1,_,_).
+    Evaluated in float32 to preserve high-frequency leading-edge coordinate precision.
+    """
+
+    def __init__(self, num_bands=FOURIER_BANDS):
         super().__init__()
         self.num_bands = num_bands
+        freqs = (2.0 ** torch.arange(num_bands, dtype=torch.float32)) * torch.pi
+        self.register_buffer("freqs", freqs, persistent=False)
 
     @property
     def out_dim(self):
         return 3 * 2 * self.num_bands
 
     def forward(self, xyz):
-        freqs = 2.0 ** torch.arange(
-            self.num_bands,
-            device=xyz.device,
-            dtype=xyz.dtype,
-        )
-        encoded = xyz.unsqueeze(-1) * freqs
+        xyz_fp32 = xyz.float()
+        encoded = xyz_fp32.unsqueeze(-1) * self.freqs
         encoded = torch.cat([torch.sin(encoded), torch.cos(encoded)], dim=-1)
-        return encoded.flatten(start_dim=1)
+        return encoded.flatten(start_dim=1).to(dtype=xyz.dtype)
 
+
+############################################
+# 2. GRAPH ENCODER (enc)
+############################################
 
 class GraphEncoderLayer(nn.Module):
-    def __init__(self, hidden_dim, edge_dim, dropout=0.2):
-        super().__init__()
+    """Deep GENConv layer with LayerNorm, GELU, and residual connection."""
 
+    def __init__(self, hidden_dim, edge_dim, dropout=DROPOUT):
+        super().__init__()
         self.conv = GENConv(
             hidden_dim,
             hidden_dim,
@@ -46,28 +70,38 @@ class GraphEncoderLayer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
 
     def forward(self, x, edge_index, edge_attr):
         out = self.conv(x, edge_index, edge_attr)
-        return self.norm(self.dropout(out))
+        out = self.act(out)
+        out = self.dropout(out)
+        return self.norm(x + out)
 
 
 class GraphEncoder(nn.Module):
+    """Encodes physical node features, geometry parameters, and coordinates into latent graph embeddings."""
+
     def __init__(
         self,
-        in_dim,
-        hidden_dim,
-        num_layers,
-        edge_dim,
-        dropout=0.2,
-        fourier_bands=6,
+        in_dim=NODE_IN_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_layers=NUM_ENCODER_LAYERS,
+        edge_dim=EDGE_DIM,
+        dropout=DROPOUT,
+        fourier_bands=FOURIER_BANDS,
+        use_checkpoint=USE_GRAD_CHECKPOINT,
     ):
         super().__init__()
-
         self.edge_dim = edge_dim
+        self.use_checkpoint = use_checkpoint
         self.pos_encoding = FourierPositionEncoding(fourier_bands)
         encoder_in_dim = in_dim - 3 + self.pos_encoding.out_dim
-        self.input_proj = nn.Linear(encoder_in_dim, hidden_dim)
+        self.input_proj = nn.Sequential(
+            nn.Linear(encoder_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
         self.layers = nn.ModuleList(
             [GraphEncoderLayer(hidden_dim, edge_dim, dropout) for _ in range(num_layers)]
         )
@@ -77,245 +111,405 @@ class GraphEncoder(nn.Module):
             return data.edge_attr.to(device=x.device, dtype=x.dtype)
         return x.new_zeros((data.edge_index.size(1), self.edge_dim))
 
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        xyz = getattr(data, "xyz", x[:, :3])
-        xyz = xyz.to(device=x.device, dtype=x.dtype)
-        x = torch.cat([self.pos_encoding(xyz), x[:, 3:]], dim=1)
+    def forward(self, data, edge_index=None, edge_attr=None, xyz=None):
+        if hasattr(data, "x"):
+            x = data.x
+            edge_index = data.edge_index
+            xyz = getattr(data, "xyz", getattr(data, "pos", x[:, :3]))
+            edge_attr = self._edge_attr(data, x)
+        else:
+            x = data
+            if xyz is None:
+                xyz = x[:, :3]
+            if edge_attr is None:
+                edge_attr = x.new_zeros((edge_index.size(1), self.edge_dim))
+
+        pos_feat = self.pos_encoding(xyz.to(device=x.device, dtype=torch.float32)).to(dtype=x.dtype)
+        x = torch.cat([pos_feat, x[:, 3:]], dim=1)
         x = self.input_proj(x)
-        edge_attr = self._edge_attr(data, x)
 
         for layer in self.layers:
-            x = x + layer(x, edge_index, edge_attr)
+            if self.training and self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad:
+                x = checkpoint(layer, x, edge_index, edge_attr, use_reentrant=False)
+            else:
+                x = layer(x, edge_index, edge_attr)
 
         return x
 
 
 ############################################
-# 2. LEARNED ATTENTION: GRAPH -> GRID
+# 3. PARALLEL GRAPH NEURAL OPERATORS (GNO)
 ############################################
 
-class ManualMultiheadAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads=4, dropout=0.0):
+class GNOKernel(nn.Module):
+    """Continuous kernel network kappa(x_i, x_j, x_j - x_i, e_ij) parameterizing integral operator."""
+
+    def __init__(self, coord_dim=3, edge_dim=EDGE_DIM, hidden_dim=HIDDEN_DIM):
         super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads")
-
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.dropout = nn.Dropout(dropout)
-
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-
-    def _reshape_heads(self, x):
-        batch_size, seq_len, _ = x.shape
-        x = x.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        return x.transpose(1, 2).contiguous()
-
-    def forward(self, query, key, value, need_weights=False):
-        q = self.q_proj(query)
-        k = self.k_proj(key)
-        v = self.v_proj(value)
-
-        q = self._reshape_heads(q)
-        k = self._reshape_heads(k)
-        v = self._reshape_heads(v)
-
-        q_fp32 = q.float()
-        k_fp32 = k.float()
-        v_fp32 = v.float()
-
-        scores = torch.matmul(q_fp32, k_fp32.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        scores = scores - scores.max(dim=-1, keepdim=True).values
-        attn = torch.softmax(scores, dim=-1)
-        if self.training:
-            attn = self.dropout(attn)
-
-        attn_out = torch.matmul(attn, v_fp32)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(query.size(0), query.size(1), self.hidden_dim)
-        attn_out = self.out_proj(attn_out.to(dtype=query.dtype))
-
-        if need_weights:
-            return attn_out, attn.detach().mean(dim=1)
-        return attn_out, None
-
-
-class CoordinateEmbedding(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-
-        self.mlp = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+        self.coord_dim = coord_dim
+        self.edge_dim = edge_dim
+        # Input: source coordinate x_j (3), target coordinate x_i (3), relative vector x_j - x_i (3), distance (1), edge_attr (edge_dim)
+        kernel_in_dim = coord_dim * 3 + 1 + edge_dim
+        self.kernel_mlp = nn.Sequential(
+            nn.Linear(kernel_in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-    def forward(self, coords):
-        return self.mlp(coords)
+    def forward(self, pos_i, pos_j, rel_pos, edge_attr):
+        # Numerically safe Euclidean norm in float32 to prevent 0/0 NaN gradients on short leading-edge edges
+        rel_fp32 = rel_pos.float()
+        dist = torch.sqrt(torch.sum(rel_fp32 * rel_fp32, dim=-1, keepdim=True) + 1e-12).to(dtype=pos_i.dtype)
+        if edge_attr is not None and edge_attr.numel() > 0:
+            edge_features = edge_attr.to(dtype=pos_i.dtype)
+            if edge_features.size(-1) < self.edge_dim:
+                edge_features = F.pad(edge_features, (0, self.edge_dim - edge_features.size(-1)), "constant", 0.0)
+            elif edge_features.size(-1) > self.edge_dim:
+                edge_features = edge_features[:, :self.edge_dim]
+        else:
+            edge_features = pos_i.new_zeros((pos_i.size(0), self.edge_dim))
+        inp = torch.cat([pos_i, pos_j, rel_pos, dist, edge_features], dim=-1)
+        return self.kernel_mlp(inp)
 
 
-class LatentGridMapper(nn.Module):
+def _prepare_gno_edge_inputs(pos_fp32, src, dst, edge_attr, edge_dim, target_dtype):
+    """Build shared GNO kernel input [pos_i, pos_j, rel_pos, dist, edge_attr] once per graph."""
+    pos_i_fp32 = pos_fp32[dst]
+    pos_j_fp32 = pos_fp32[src]
+    rel_fp32 = pos_j_fp32 - pos_i_fp32
+    dist_fp32 = torch.sqrt(torch.sum(rel_fp32 * rel_fp32, dim=-1, keepdim=True) + 1e-12)
+
+    pos_i = pos_i_fp32.to(dtype=target_dtype)
+    pos_j = pos_j_fp32.to(dtype=target_dtype)
+    rel_pos = rel_fp32.to(dtype=target_dtype)
+    dist = dist_fp32.to(dtype=target_dtype)
+
+    if edge_attr is not None and edge_attr.numel() > 0:
+        edge_features = edge_attr.to(dtype=target_dtype)
+        if edge_features.size(-1) < edge_dim:
+            edge_features = F.pad(edge_features, (0, edge_dim - edge_features.size(-1)), "constant", 0.0)
+        elif edge_features.size(-1) > edge_dim:
+            edge_features = edge_features[:, :edge_dim]
+    else:
+        edge_features = pos_i.new_zeros((pos_i.size(0), edge_dim))
+
+    return torch.cat([pos_i, pos_j, rel_pos, dist, edge_features], dim=-1)
+
+
+class GNOLayer(nn.Module):
+    """Continuous Graph Neural Operator layer:
+    Evaluates kernel integral (K h)(x_i) = int_{N(i)} kappa(x_i, x_j, e_ij) h(x_j) dmu(x_j)
+    passing graph values along the domain from (0,0,0) to (1,_,_).
+    Supports precomputed shared edge inputs & inverse degree across parallel GNO layers,
+    plus optional chunked edge evaluation when VRAM is constrained.
+    """
+
     def __init__(
         self,
         hidden_dim,
-        grid_size,
-        dropout=0.2,
-        num_heads=4,
-        query_chunk_size=4096,
-        max_attention_nodes=1024,
+        edge_dim=EDGE_DIM,
+        coord_dim=3,
+        dropout=DROPOUT,
+        edge_chunk_size=GNO_EDGE_CHUNK_SIZE,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.grid_size = grid_size
-        self.query_chunk_size = query_chunk_size
-        self.max_attention_nodes = max_attention_nodes
-
-        self.node_pos = CoordinateEmbedding(hidden_dim)
-        self.grid_pos = CoordinateEmbedding(hidden_dim)
-        self.node_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.grid_query_bias = nn.Parameter(torch.randn(hidden_dim) * 0.02)
-        self.attn = ManualMultiheadAttention(
-            hidden_dim, num_heads=num_heads, dropout=dropout
-        )
+        self.edge_chunk_size = edge_chunk_size
+        self.kernel_net = GNOKernel(coord_dim=coord_dim, edge_dim=edge_dim, hidden_dim=hidden_dim)
+        self.linear_self = nn.Linear(hidden_dim, hidden_dim)
+        self.linear_out = nn.Linear(hidden_dim, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.GELU()
 
-    def _grid_coords(self, device, dtype):
-        H, W = self.grid_size
-        y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
-        x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        return torch.stack([yy, xx], dim=-1).view(H * W, 2)
+    def _integrate_edges(
+        self,
+        h,
+        edge_index,
+        pos_fp32,
+        edge_attr=None,
+        weights=None,
+        precomputed_kernel_inp=None,
+        inv_deg=None,
+    ):
+        src, dst = edge_index
+        num_nodes = h.size(0)
+        num_edges = edge_index.size(1)
+        agg_fp32 = torch.zeros((num_nodes, h.size(1)), device=h.device, dtype=torch.float32)
+        if num_edges == 0:
+            return agg_fp32.to(dtype=h.dtype)
 
-    def _select_attention_nodes(self, node_features, node_coords):
-        num_nodes = node_features.size(0)
-        if num_nodes <= self.max_attention_nodes:
-            return node_features, node_coords
+        chunk_size = self.edge_chunk_size if (self.edge_chunk_size and self.edge_chunk_size > 0) else num_edges
 
-        idx = torch.linspace(
-            0,
-            num_nodes - 1,
-            self.max_attention_nodes,
-            device=node_features.device,
-        ).long()
-        return node_features.index_select(0, idx), node_coords.index_select(0, idx)
+        if precomputed_kernel_inp is not None and chunk_size >= num_edges:
+            kernel_val = self.kernel_net.kernel_mlp(precomputed_kernel_inp)
+            msg = h[src].to(dtype=kernel_val.dtype) * kernel_val
+            if weights is not None:
+                msg = msg * weights[src].unsqueeze(-1).to(dtype=msg.dtype)
+            agg_fp32.index_add_(0, dst, msg.float())
+        else:
+            for start in range(0, num_edges, chunk_size):
+                end = min(start + chunk_size, num_edges)
+                src_c = src[start:end]
+                dst_c = dst[start:end]
 
-    def forward(self, node_features, node_coords):
-        if node_features.dim() != 2:
-            raise ValueError("LatentGridMapper expects a single graph with shape [N, C].")
+                if precomputed_kernel_inp is not None:
+                    kernel_val = self.kernel_net.kernel_mlp(precomputed_kernel_inp[start:end])
+                else:
+                    pos_i = pos_fp32[dst_c].to(dtype=h.dtype)
+                    pos_j = pos_fp32[src_c].to(dtype=h.dtype)
+                    rel_pos = (pos_fp32[src_c] - pos_fp32[dst_c]).to(dtype=h.dtype)
+                    ea_c = edge_attr[start:end] if (edge_attr is not None and edge_attr.numel() > 0) else None
+                    kernel_val = self.kernel_net(pos_i, pos_j, rel_pos, ea_c)
 
-        H, W = self.grid_size
-        device = node_features.device
-        dtype = node_features.dtype
+                msg = h[src_c].to(dtype=kernel_val.dtype) * kernel_val
+                if weights is not None:
+                    msg = msg * weights[src_c].unsqueeze(-1).to(dtype=msg.dtype)
 
-        node_features, node_coords = self._select_attention_nodes(
-            node_features, node_coords
+                agg_fp32.index_add_(0, dst_c, msg.float())
+
+        if weights is None:
+            if inv_deg is None:
+                deg = torch.bincount(dst, minlength=num_nodes).to(dtype=torch.float32).unsqueeze(-1)
+                inv_deg = deg.clamp_min(1.0).reciprocal()
+            agg_fp32 = agg_fp32 * inv_deg
+
+        return agg_fp32.to(dtype=h.dtype)
+
+    def forward(
+        self,
+        h,
+        edge_index,
+        pos,
+        edge_attr=None,
+        weights=None,
+        precomputed_kernel_inp=None,
+        inv_deg=None,
+    ):
+        pos_fp32 = None
+        if precomputed_kernel_inp is None:
+            pos_fp32 = pos.to(dtype=torch.float32, device=h.device)
+            if pos_fp32.size(-1) == 2:
+                pos_fp32 = F.pad(pos_fp32, (0, 1), "constant", 0.0)
+            elif pos_fp32.size(-1) > 3:
+                pos_fp32 = pos_fp32[:, :3]
+
+        agg = self._integrate_edges(
+            h,
+            edge_index,
+            pos_fp32,
+            edge_attr=edge_attr,
+            weights=weights,
+            precomputed_kernel_inp=precomputed_kernel_inp,
+            inv_deg=inv_deg,
         )
-        kv = self.node_proj(node_features) + self.node_pos(node_coords)
-        kv = kv.unsqueeze(0)
 
-        grid_coords = self._grid_coords(device, dtype)
-        grid_chunks = []
-
-        for start in range(0, grid_coords.size(0), self.query_chunk_size):
-            coords = grid_coords[start:start + self.query_chunk_size]
-            query = self.grid_pos(coords)
-            query = query + self.grid_query_bias.to(dtype=query.dtype)
-            query = query.unsqueeze(0)
-            out, _ = self.attn(query, kv, kv, need_weights=False)
-            out = self.norm(out + query)
-            grid_chunks.append(out.squeeze(0))
-
-        grid_tokens = torch.cat(grid_chunks, dim=0)
-        return grid_tokens.T.contiguous().view(1, self.hidden_dim, H, W)
+        out = self.linear_self(h) + self.linear_out(agg)
+        out = self.dropout(self.act(out))
+        return self.norm(h + out)
 
 
-############################################
-# 3. SPECTRAL CONV (REDUCED MODES)
-############################################
+class GraphNeuralOperator(nn.Module):
+    """Single GNO branch with k stacked GNO kernel layers (configurable: k = 2, 3, 4, 5, etc.)."""
 
-class SpectralConv2d(nn.Module):
     def __init__(
         self,
-        in_channels,
-        out_channels,
-        grid_size,
-        modes_ratio=0.015,
-        min_modes=8,
-        max_modes=20,
+        hidden_dim,
+        num_layers=NUM_GNO_LAYERS,
+        edge_dim=EDGE_DIM,
+        coord_dim=3,
+        dropout=DROPOUT,
+        use_checkpoint=USE_GRAD_CHECKPOINT,
+        edge_chunk_size=GNO_EDGE_CHUNK_SIZE,
     ):
         super().__init__()
-
-        H, W = grid_size
-
-        self.modes1 = max(min_modes, min(int(H * modes_ratio), max_modes))
-        self.modes2 = max(min_modes, min(int(W * modes_ratio), max_modes))
-
-        self.scale = 1 / (in_channels * out_channels)
-
-        self.weights_real = nn.Parameter(
-            self.scale * torch.randn(
-                in_channels, out_channels, self.modes1, self.modes2
+        self.num_layers = num_layers
+        self.use_checkpoint = use_checkpoint
+        self.layers = nn.ModuleList([
+            GNOLayer(
+                hidden_dim=hidden_dim,
+                edge_dim=edge_dim,
+                coord_dim=coord_dim,
+                dropout=dropout,
+                edge_chunk_size=edge_chunk_size,
             )
-        )
-        self.weights_imag = nn.Parameter(
-            self.scale * torch.randn(
-                in_channels, out_channels, self.modes1, self.modes2
-            )
-        )
+            for _ in range(num_layers)
+        ])
 
-    def forward(self, x):
-        x = x.float()
-        x_ft = torch.fft.rfft2(x)
+    def forward(
+        self,
+        h,
+        edge_index,
+        pos,
+        edge_attr=None,
+        weights=None,
+        precomputed_kernel_inp=None,
+        inv_deg=None,
+    ):
+        for layer in self.layers:
+            if self.training and self.use_checkpoint and torch.is_grad_enabled() and h.requires_grad:
+                h = checkpoint(
+                    layer,
+                    h,
+                    edge_index,
+                    pos,
+                    edge_attr,
+                    weights,
+                    precomputed_kernel_inp,
+                    inv_deg,
+                    use_reentrant=False,
+                )
+            else:
+                h = layer(
+                    h,
+                    edge_index,
+                    pos,
+                    edge_attr=edge_attr,
+                    weights=weights,
+                    precomputed_kernel_inp=precomputed_kernel_inp,
+                    inv_deg=inv_deg,
+                )
+        return h
 
-        weights = torch.complex(
-            self.weights_real.float(),
-            self.weights_imag.float(),
-        )
 
-        x_ft_low = x_ft[:, :, : self.modes1, : self.modes2]
-        out_ft_low = torch.einsum("bixy,ioxy->boxy", x_ft_low, weights)
+class ParallelGraphNeuralOperator(nn.Module):
+    """Parallel multi-branch Graph Neural Operator block:
+                    latent (from enc)
+                           |
+        ---------------------------------------
+        |                  |                  |
+    GNO(k_1 layers)    GNO(k_2 layers)    GNO(k_3 layers) ...
+        ---------------------------------------
+                           |
+                     fused output (to dec)
 
-        pad_right = (x.shape[-1] // 2 + 1) - self.modes2
-        pad_bottom = x.shape[-2] - self.modes1
+    Both `num_branches` and `num_layers` per branch (int or list like [2,3,4] or [4,5,6])
+    are completely configurable from config.py.
+    """
 
-        out_ft = F.pad(out_ft_low, (0, pad_right, 0, pad_bottom))
-        x_out = torch.fft.irfft2(out_ft, s=(x.shape[-2], x.shape[-1]))
-
-        return x_out
-
-
-class FNOBlock(nn.Module):
-    def __init__(self, hidden_dim, grid_size):
+    def __init__(
+        self,
+        hidden_dim=HIDDEN_DIM,
+        num_branches=NUM_GNO_BRANCHES,
+        num_layers=NUM_GNO_LAYERS,
+        edge_dim=EDGE_DIM,
+        coord_dim=3,
+        dropout=DROPOUT,
+        fusion=GNO_FUSION,
+        use_checkpoint=USE_GRAD_CHECKPOINT,
+        edge_chunk_size=GNO_EDGE_CHUNK_SIZE,
+    ):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        self.edge_dim = edge_dim
+        self.num_branches = max(1, int(num_branches))
+        self.num_layers = num_layers
+        self.fusion = fusion.lower()
 
-        self.spectral = SpectralConv2d(hidden_dim, hidden_dim, grid_size)
-        self.pointwise = nn.Conv2d(hidden_dim, hidden_dim, 1)
+        # Support either uniform int k layers per branch or a list of layer counts per branch
+        if isinstance(num_layers, (list, tuple)):
+            branch_depths = [int(k) for k in num_layers]
+            self.num_branches = len(branch_depths)
+        else:
+            branch_depths = [int(num_layers)] * self.num_branches
+        self.branch_depths = branch_depths
+
+        self.branches = nn.ModuleList([
+            GraphNeuralOperator(
+                hidden_dim=hidden_dim,
+                num_layers=k,
+                edge_dim=edge_dim,
+                coord_dim=coord_dim,
+                dropout=dropout,
+                use_checkpoint=use_checkpoint,
+                edge_chunk_size=edge_chunk_size,
+            )
+            for k in branch_depths
+        ])
+
+        if self.fusion == "concat" and self.num_branches > 1:
+            self.fusion_proj = nn.Sequential(
+                nn.Linear(hidden_dim * self.num_branches, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.fusion_proj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x):
-        x = self.spectral(x) + self.pointwise(x)
-        x = F.gelu(x)
+    def forward(self, h, edge_index, pos, edge_attr=None, weights=None):
+        # Precompute shared edge kernel inputs and inverse node degrees ONCE for all parallel GNO layers
+        pos_fp32 = pos.to(dtype=torch.float32, device=h.device)
+        if pos_fp32.size(-1) == 2:
+            pos_fp32 = F.pad(pos_fp32, (0, 1), "constant", 0.0)
+        elif pos_fp32.size(-1) > 3:
+            pos_fp32 = pos_fp32[:, :3]
 
-        B, C, H, W = x.shape
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
-        x = x.permute(0, 3, 1, 2)
+        src, dst = edge_index
+        num_nodes = h.size(0)
 
-        return x
+        inv_deg = None
+        if weights is None:
+            deg = torch.bincount(dst, minlength=num_nodes).to(dtype=torch.float32).unsqueeze(-1)
+            inv_deg = deg.clamp_min(1.0).reciprocal()
+
+        if h.is_cuda and torch.is_autocast_enabled():
+            target_dtype = (
+                torch.get_autocast_dtype("cuda")
+                if hasattr(torch, "get_autocast_dtype")
+                else torch.get_autocast_gpu_dtype()
+            )
+        else:
+            target_dtype = h.dtype
+        precomputed_kernel_inp = _prepare_gno_edge_inputs(
+            pos_fp32, src, dst, edge_attr, self.edge_dim, target_dtype
+        )
+
+        branch_outputs = [
+            branch(
+                h,
+                edge_index,
+                pos_fp32,
+                edge_attr=edge_attr,
+                weights=weights,
+                precomputed_kernel_inp=precomputed_kernel_inp,
+                inv_deg=inv_deg,
+            )
+            for branch in self.branches
+        ]
+
+        if self.num_branches == 1:
+            merged = branch_outputs[0]
+        elif self.fusion == "concat":
+            merged = torch.cat(branch_outputs, dim=-1)
+        elif self.fusion == "sum":
+            merged = torch.stack(branch_outputs, dim=0).sum(dim=0)
+        elif self.fusion == "mean":
+            merged = torch.stack(branch_outputs, dim=0).mean(dim=0)
+        else:
+            raise ValueError(f"Unsupported GNO_FUSION mode: {self.fusion}")
+
+        fused = self.fusion_proj(merged)
+        return self.norm(h + fused)
 
 
 ############################################
-# 4. GRID -> GRAPH DECODER
+# 4. GRAPH DECODER (dec)
 ############################################
 
-class GraphRefineLayer(nn.Module):
-    def __init__(self, hidden_dim, edge_dim, dropout=0.2):
+class GraphDecoderLayer(nn.Module):
+    """Decoder layer transforming fused operator features."""
+
+    def __init__(self, hidden_dim, edge_dim, dropout=DROPOUT):
         super().__init__()
-
         self.conv = GENConv(
             hidden_dim,
             hidden_dim,
@@ -327,151 +521,254 @@ class GraphRefineLayer(nn.Module):
             edge_dim=edge_dim,
         )
         self.dropout = nn.Dropout(dropout)
-
         self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
 
     def forward(self, x, edge_index, edge_attr):
         out = self.conv(x, edge_index, edge_attr)
-        return self.norm(self.dropout(out))
+        out = self.act(out)
+        out = self.dropout(out)
+        return self.norm(x + out)
 
 
 class GraphDecoder(nn.Module):
+    """Decodes parallel GNO representations into decoded graph latent representations."""
+
     def __init__(
         self,
-        hidden_dim,
-        out_dim,
-        edge_dim,
-        dropout=0.2,
-        num_heads=4,
-        local_radius=1,
+        hidden_dim=HIDDEN_DIM,
+        num_layers=NUM_DECODER_LAYERS,
+        edge_dim=EDGE_DIM,
+        dropout=DROPOUT,
+        use_checkpoint=USE_GRAD_CHECKPOINT,
     ):
         super().__init__()
-
-        self.local_radius = local_radius
-        self.node_pos = CoordinateEmbedding(hidden_dim)
-        self.grid_pos = CoordinateEmbedding(hidden_dim)
-        self.sample_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.query_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.cross_attn = ManualMultiheadAttention(
-            hidden_dim, num_heads=num_heads, dropout=dropout
-        )
         self.edge_dim = edge_dim
-        self.refine = GraphRefineLayer(hidden_dim, edge_dim, dropout)
-        self.attn_norm = nn.LayerNorm(hidden_dim)
-        self.gnn_norm = nn.LayerNorm(hidden_dim)
-        self.mlp = nn.Sequential(
+        self.use_checkpoint = use_checkpoint
+        self.layers = nn.ModuleList(
+            [GraphDecoderLayer(hidden_dim, edge_dim, dropout) for _ in range(num_layers)]
+        )
+        self.proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+
+    def _edge_attr(self, edge_index, edge_attr, x):
+        if edge_attr is not None:
+            return edge_attr.to(device=x.device, dtype=x.dtype)
+        return x.new_zeros((edge_index.size(1), self.edge_dim))
+
+    def forward(self, latent, edge_index, edge_attr=None):
+        edge_attr = self._edge_attr(edge_index, edge_attr, latent)
+        x = latent
+        for layer in self.layers:
+            if self.training and self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad:
+                x = checkpoint(layer, x, edge_index, edge_attr, use_reentrant=False)
+            else:
+                x = layer(x, edge_index, edge_attr)
+        return self.proj(x)
+
+
+############################################
+# 5. POST-DECODER GNN HEAD (gnn)
+############################################
+
+class GraphGNNLayer(nn.Module):
+    """Post-decoder GNN message-passing layer for local surface field refinement."""
+
+    def __init__(self, hidden_dim, edge_dim, dropout=DROPOUT):
+        super().__init__()
+        self.conv = GENConv(
+            hidden_dim,
+            hidden_dim,
+            aggr="softmax",
+            t=1.0,
+            learn_t=True,
+            num_layers=2,
+            norm="layer",
+            edge_dim=edge_dim,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+
+    def forward(self, x, edge_index, edge_attr):
+        out = self.conv(x, edge_index, edge_attr)
+        out = self.act(out)
+        out = self.dropout(out)
+        return self.norm(x + out)
+
+
+class GraphRefinementGNN(nn.Module):
+    """Final GNN stage (dec -> gnn) that refines decoded features on the mesh graph and predicts Cp."""
+
+    def __init__(
+        self,
+        hidden_dim=HIDDEN_DIM,
+        out_dim=OUT_DIM,
+        num_layers=NUM_GNN_LAYERS,
+        edge_dim=EDGE_DIM,
+        dropout=DROPOUT,
+        use_checkpoint=USE_GRAD_CHECKPOINT,
+    ):
+        super().__init__()
+        self.edge_dim = edge_dim
+        self.use_checkpoint = use_checkpoint
+        self.layers = nn.ModuleList(
+            [GraphGNNLayer(hidden_dim, edge_dim, dropout) for _ in range(num_layers)]
+        )
+        self.readout = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, out_dim),
         )
 
-    def _local_offsets(self, device, dtype, grid):
-        H, W = grid.shape[-2:]
-        offsets = []
-        for dy in range(-self.local_radius, self.local_radius + 1):
-            for dx in range(-self.local_radius, self.local_radius + 1):
-                offsets.append((2.0 * dy / max(H - 1, 1), 2.0 * dx / max(W - 1, 1)))
-        return torch.tensor(offsets, device=device, dtype=dtype)
-
-    def _sample_local_grid(self, grid, node_coords):
-        offsets = self._local_offsets(grid.device, grid.dtype, grid)
-        local_coords = node_coords.unsqueeze(1) + offsets.unsqueeze(0)
-        local_coords = local_coords.clamp(-1, 1)
-
-        sample_coords = torch.stack(
-            [local_coords[..., 1], local_coords[..., 0]],
-            dim=-1,
-        ).unsqueeze(0)
-
-        sampled = F.grid_sample(
-            grid,
-            sample_coords,
-            mode="bilinear",
-            align_corners=True,
-        )
-        sampled = sampled.squeeze(0).permute(1, 2, 0).contiguous()
-        return sampled, local_coords
-
-    def _edge_attr(self, edge_index, edge_attr, node_latent):
+    def _edge_attr(self, edge_index, edge_attr, x):
         if edge_attr is not None:
-            return edge_attr.to(device=node_latent.device, dtype=node_latent.dtype)
-        return node_latent.new_zeros((edge_index.size(1), self.edge_dim))
+            return edge_attr.to(device=x.device, dtype=x.dtype)
+        return x.new_zeros((edge_index.size(1), self.edge_dim))
 
-    def forward(self, grid, node_coords, node_latent, edge_index, edge_attr=None):
-        sampled_grid, sampled_coords = self._sample_local_grid(grid, node_coords)
-
-        keys = self.sample_proj(sampled_grid) + self.grid_pos(sampled_coords)
-        query = self.query_proj(node_latent) + self.node_pos(node_coords)
-        query = query.unsqueeze(1)
-
-        attn_out, _ = self.cross_attn(query, keys, keys, need_weights=False)
-        node_latent = self.attn_norm(node_latent + attn_out.squeeze(1))
-
-        edge_attr = self._edge_attr(edge_index, edge_attr, node_latent)
-        refined = self.refine(node_latent, edge_index, edge_attr)
-        node_latent = self.gnn_norm(node_latent + refined)
-
-        return self.mlp(node_latent)
+    def forward(self, x, edge_index, edge_attr=None):
+        edge_attr = self._edge_attr(edge_index, edge_attr, x)
+        for layer in self.layers:
+            if self.training and self.use_checkpoint and torch.is_grad_enabled() and x.requires_grad:
+                x = checkpoint(layer, x, edge_index, edge_attr, use_reentrant=False)
+            else:
+                x = layer(x, edge_index, edge_attr)
+        return self.readout(x)
 
 
 ############################################
-# 5. FULL MODEL
+# 6. FULL ARCHITECTURE:
+#    ENC -> PARALLEL GNOs (B x K) -> DEC -> GNN
 ############################################
 
-class GAGNO(nn.Module):
+class EncoderGNODecoder(nn.Module):
+    """Complete modular architecture:
+                    enc
+                     |
+        ----------------------------
+        |                          |
+    GNO(k_1 layers)          GNO(k_B layers)   [Configurable B parallel branches]
+        ----------------------------
+                     |
+                 dec -> gnn
+    """
+
     def __init__(
         self,
-        node_in_dim,
-        hidden_dim,
-        out_dim,
-        num_gnn_layers,
-        grid_size=(1024, 512),
-        edge_dim=8,
-        dropout=0.2,
-        fourier_bands=6,
-        attention_heads=4,
-        attention_query_chunk_size=4096,
-        attention_max_nodes=1024,
-        attention_local_radius=1,
+        node_in_dim=NODE_IN_DIM,
+        hidden_dim=HIDDEN_DIM,
+        out_dim=OUT_DIM,
+        num_encoder_layers=NUM_ENCODER_LAYERS,
+        num_gno_branches=NUM_GNO_BRANCHES,
+        num_gno_layers=NUM_GNO_LAYERS,
+        gno_fusion=GNO_FUSION,
+        num_decoder_layers=NUM_DECODER_LAYERS,
+        num_gnn_layers=NUM_GNN_LAYERS,
+        edge_dim=EDGE_DIM,
+        dropout=DROPOUT,
+        fourier_bands=FOURIER_BANDS,
+        use_checkpoint=USE_GRAD_CHECKPOINT,
+        edge_chunk_size=GNO_EDGE_CHUNK_SIZE,
+        **kwargs,
     ):
         super().__init__()
 
+        # Support flexible keyword aliases
+        if "num_parallel_gno" in kwargs and kwargs["num_parallel_gno"] is not None:
+            num_gno_branches = kwargs["num_parallel_gno"]
+        elif "gno_branches" in kwargs and kwargs["gno_branches"] is not None:
+            num_gno_branches = kwargs["gno_branches"]
+
+        if "gno_layers" in kwargs and kwargs["gno_layers"] is not None:
+            num_gno_layers = kwargs["gno_layers"]
+
+        if isinstance(num_gno_layers, (list, tuple)):
+            num_gno_branches = len(num_gno_layers)
+
+        self.num_encoder_layers = num_encoder_layers
+        self.num_gno_branches = num_gno_branches
+        self.num_gno_layers = num_gno_layers
+        self.gno_fusion = gno_fusion
+        self.num_decoder_layers = num_decoder_layers
+        self.num_gnn_layers = num_gnn_layers
+        self.use_checkpoint = use_checkpoint
+
+        # 1. Encoder (enc)
         self.encoder = GraphEncoder(
-            node_in_dim,
-            hidden_dim,
-            num_gnn_layers,
+            in_dim=node_in_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_encoder_layers,
             edge_dim=edge_dim,
             dropout=dropout,
             fourier_bands=fourier_bands,
+            use_checkpoint=use_checkpoint,
         )
-        self.mapper = LatentGridMapper(
-            hidden_dim,
-            grid_size,
+
+        # 2. Parallel Multi-Branch GNOs: B parallel blocks, each with k GNO layers
+        self.gno = ParallelGraphNeuralOperator(
+            hidden_dim=hidden_dim,
+            num_branches=num_gno_branches,
+            num_layers=num_gno_layers,
+            edge_dim=edge_dim,
+            coord_dim=3,
             dropout=dropout,
-            num_heads=attention_heads,
-            query_chunk_size=attention_query_chunk_size,
-            max_attention_nodes=attention_max_nodes,
+            fusion=gno_fusion,
+            use_checkpoint=use_checkpoint,
+            edge_chunk_size=edge_chunk_size,
         )
 
-        self.fno = nn.Sequential(
-            FNOBlock(hidden_dim, grid_size),
-            FNOBlock(hidden_dim, grid_size),
-            FNOBlock(hidden_dim, grid_size),
-        )
-
+        # 3. Decoder (dec)
         self.decoder = GraphDecoder(
-            hidden_dim,
-            out_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_decoder_layers,
             edge_dim=edge_dim,
             dropout=dropout,
-            num_heads=attention_heads,
-            local_radius=attention_local_radius,
+            use_checkpoint=use_checkpoint,
         )
 
-    def forward(self, data):
-        node_latent = self.encoder(data)
-        grid = self.mapper(node_latent, data.pos)
-        grid = self.fno(grid)
-        edge_attr = getattr(data, "edge_attr", None)
-        return self.decoder(grid, data.pos, node_latent, data.edge_index, edge_attr)
+        # 4. Post-Decoder GNN (gnn)
+        self.gnn = GraphRefinementGNN(
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            num_layers=num_gnn_layers,
+            edge_dim=edge_dim,
+            dropout=dropout,
+            use_checkpoint=use_checkpoint,
+        )
+
+    def encode(self, data, edge_index=None, edge_attr=None, xyz=None):
+        return self.encoder(data, edge_index=edge_index, edge_attr=edge_attr, xyz=xyz)
+
+    def forward(self, data, edge_index=None, edge_attr=None, pos=None):
+        if hasattr(data, "edge_index"):
+            edge_index = data.edge_index
+            edge_attr = getattr(data, "edge_attr", None)
+            if hasattr(data, "xyz") and data.xyz is not None and data.xyz.size(-1) == 3:
+                pos = data.xyz
+            elif hasattr(data, "pos") and data.pos is not None and data.pos.size(-1) == 3:
+                pos = data.pos
+            elif hasattr(data, "x") and data.x is not None and data.x.size(-1) >= 3:
+                pos = data.x[:, :3]
+            elif hasattr(data, "pos") and data.pos is not None:
+                pos = data.pos
+            else:
+                pos = None
+            latent = self.encoder(data)
+        else:
+            if pos is None:
+                pos = data[:, :3] if (hasattr(data, "shape") and data.shape[-1] >= 3) else data
+            latent = self.encoder(data, edge_index=edge_index, edge_attr=edge_attr)
+
+        gno_out = self.gno(latent, edge_index, pos, edge_attr)
+        dec_out = self.decoder(gno_out, edge_index, edge_attr)
+        return self.gnn(dec_out, edge_index, edge_attr)
+
+
+# Aliases for backward compatibility
+EncoderDecoder = EncoderGNODecoder
+GAGNO = EncoderGNODecoder
+GIGNO = EncoderGNODecoder

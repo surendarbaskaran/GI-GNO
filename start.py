@@ -33,9 +33,19 @@ def main():
 
     start=time.time()
 
-    preprocessing.main()
+    # preprocessing.main()
     training.main()
-    inference.main()
+    # inference.main()
+    result=inference.run_inference(
+        "dataset/testvtk/case_0473.vtk",
+        {"geom_name": "geom_047",
+        "alt_kft": 2.541,
+        "Re": 21630000,
+        "M_inf": 0.4881,
+        "alpha_deg": 11.05,
+        "beta_deg": 0,}
+    )
+    print(result)
 
     elapsed = time.time() - start
 

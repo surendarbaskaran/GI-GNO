@@ -4,3 +4,4 @@ logs/
 predicted/
 ptfiles
 __pycache__
+secret.txt
